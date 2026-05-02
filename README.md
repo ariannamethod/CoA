@@ -1,2 +1,1 @@
-# -CoA
-Chain Of Arianna
+# CoA: The Chain Of Arianna
