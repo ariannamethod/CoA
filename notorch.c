@@ -956,6 +956,49 @@ void nt_tape_backward(int loss_idx) {
                 float* dq = (float*)calloc(T * D, sizeof(float));
                 float* dk = (float*)calloc(T * D, sizeof(float));
                 float* dv = (float*)calloc(T * D, sizeof(float));
+                int mh_done_gpu = 0;
+#ifdef USE_CUDA
+                /* GPU backward: kernel needs softmaxed scores. Forward did not
+                 * persist them, so re-run forward into scratch first.
+                 * Slot map (GPU_SCRATCH_SLOTS=16):
+                 *   0 silu, 1 mh-attn scores, 2 cross_ent losses,
+                 *   3,4 seq_matvec_bw d_dx/d_dw,
+                 *   5,6 mh_bw scratch_TT/scratch_TT2, 7 mh recompute out,
+                 *   8,9,10 mh_bw d_dQ/d_dK/d_dV. */
+                if (g_use_gpu && dq && dk && dv) {
+                    float* d_Q = nt_tensor_ensure_gpu(pq->output);
+                    float* d_K = nt_tensor_ensure_gpu(pk->output);
+                    float* d_V = nt_tensor_ensure_gpu(pv->output);
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_scores = gpu_scratch(1, n_heads * T * T);
+                    float* d_scratch_TT  = gpu_scratch(5, n_heads * T * T);
+                    float* d_scratch_TT2 = gpu_scratch(6, n_heads * T * T);
+                    float* d_out_tmp = gpu_scratch(7, T * D);
+                    float* d_dQ_buf  = gpu_scratch(8, T * D);
+                    float* d_dK_buf  = gpu_scratch(9, T * D);
+                    float* d_dV_buf  = gpu_scratch(10, T * D);
+                    if (d_Q && d_K && d_V && d_dout && d_scores && d_scratch_TT &&
+                        d_scratch_TT2 && d_out_tmp && d_dQ_buf && d_dK_buf && d_dV_buf) {
+                        /* Recompute softmaxed scores (kernel writes them). */
+                        gpu_multi_head_attention(d_Q, d_K, d_V, d_out_tmp, d_scores, T, D, n_heads);
+                        gpu_multi_head_attention_backward(d_Q, d_K, d_V, d_scores, d_dout,
+                                                          d_dQ_buf, d_dK_buf, d_dV_buf,
+                                                          d_scratch_TT, d_scratch_TT2,
+                                                          T, D, n_heads);
+                        gpu_download(dq, d_dQ_buf, T * D);
+                        gpu_download(dk, d_dK_buf, T * D);
+                        gpu_download(dv, d_dV_buf, T * D);
+                        mh_done_gpu = 1;
+                    }
+                }
+#endif
+                if (mh_done_gpu) {
+                    tape_acc_grad(e->parent1, dq, T * D);
+                    tape_acc_grad(e->parent2, dk, T * D);
+                    tape_acc_grad(e->parent3, dv, T * D);
+                    free(dq); free(dk); free(dv);
+                    break;
+                }
                 if (dq && dk && dv) {
                     for (int h = 0; h < n_heads; h++) {
                         int ho = h * head_dim;
@@ -1360,7 +1403,31 @@ void nt_tape_backward(int loss_idx) {
                 int T = (int)e->aux;
                 int V = (int)e->aux2;
                 float* dl = (float*)calloc(T * V, sizeof(float));
-                if (dl && pt) {
+                int ce_done_gpu = 0;
+#ifdef USE_CUDA
+                /* GPU backward: kernel produces (softmax - one_hot) / T scaled by 1.
+                 * Forward dout is loss tensor (length 1) but the gradient flowing back
+                 * to logits is indep of dout's value when dout[0]=1 (loss is leaf in
+                 * graph terms). Standard practice: assume dout[0] propagates as
+                 * scalar through cross-entropy, baking 1/T into kernel.
+                 * Multiply post-hoc by dout[0] to honor chain rule. */
+                if (g_use_gpu && dl && pt) {
+                    float* d_logits = nt_tensor_ensure_gpu(pl->output);
+                    float* d_targets = nt_tensor_ensure_gpu(pt->output);
+                    float* d_grad_logits = gpu_scratch(11, T * V);
+                    if (d_logits && d_targets && d_grad_logits) {
+                        gpu_cross_entropy_backward(d_grad_logits, d_logits, d_targets, T, V);
+                        gpu_download(dl, d_grad_logits, T * V);
+                        /* dout[0] scaling: kernel already divides by T; multiply by dout[0]. */
+                        if (dout[0] != 1.0f) {
+                            float s = dout[0];
+                            for (int j = 0; j < T * V; j++) dl[j] *= s;
+                        }
+                        ce_done_gpu = 1;
+                    }
+                }
+#endif
+                if (!ce_done_gpu && dl && pt) {
                     for (int t = 0; t < T; t++) {
                         float* logits_t = pl->output->data + t * V;
                         int target = (int)pt->output->data[t];
@@ -1378,8 +1445,8 @@ void nt_tape_backward(int loss_idx) {
                         float s = dout[0] / T;
                         for (int j = 0; j < V; j++) dl[t * V + j] *= s;
                     }
-                    tape_acc_grad(e->parent1, dl, T * V);
                 }
+                if (dl) tape_acc_grad(e->parent1, dl, T * V);
                 free(dl);
             }
             break;

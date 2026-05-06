@@ -394,7 +394,7 @@ extern "C" void gpu_sync_dirty_weights(void) {
 }
 
 
-#define GPU_SCRATCH_SLOTS 8
+#define GPU_SCRATCH_SLOTS 16
 static float* g_scratch_buf[GPU_SCRATCH_SLOTS];
 static size_t g_scratch_sz[GPU_SCRATCH_SLOTS];
 
