@@ -1155,6 +1155,54 @@ void nt_tape_backward(int loss_idx) {
                 float* dwr = (float*)calloc(combined_len, sizeof(float));
                 float* dx  = (float*)calloc((long)T * n_embd, sizeof(float));
                 float* dv  = (float*)calloc((long)T * out_dim, sizeof(float));
+
+                int rrlr_bw_gpu = 0;
+#ifdef USE_CUDA
+                if (g_use_gpu && dwr && dx && dv) {
+                    /* Recompute U and scores on GPU (forward did not persist
+                     * across tape boundary cleanly — this is cheap: H·T·R + H·T·T floats). */
+                    float* d_X  = nt_tensor_ensure_gpu(px->output);
+                    float* d_Wr = nt_tensor_ensure_gpu(pwr->output);
+                    float* d_V  = nt_tensor_ensure_gpu(pv->output);
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_U      = gpu_scratch(12, nr * T * rank);
+                    float* d_scores = gpu_scratch(1,  nr * T * T);
+                    float* d_O_tmp  = gpu_scratch(7,  T * out_dim);
+                    float* d_d_attn  = gpu_scratch(13, nr * T * T);
+                    float* d_d_score = gpu_scratch(14, nr * T * T);
+                    /* Per-tensor scratch for backward outputs (T*E, combined_len, T*out_dim).
+                     * Use fresh slots 15 + dynamic alloc for combined_len if it's large. */
+                    float* d_dX = gpu_scratch(15, T * n_embd);
+                    /* Slots are 16 — running out. Allocate transient buffers via gpu_alloc
+                     * for d_dWr_combined and d_dV (one-time per backward). */
+                    float* d_dWr = gpu_alloc(combined_len);
+                    float* d_dV  = gpu_alloc(T * out_dim);
+                    if (d_X && d_Wr && d_V && d_dout && d_U && d_scores && d_O_tmp &&
+                        d_d_attn && d_d_score && d_dX && d_dWr && d_dV) {
+                        /* Recompute forward (writes U and scores). */
+                        gpu_rrpram_lr_forward(d_X, d_Wr, d_V, d_O_tmp, d_U, d_scores,
+                                              T, n_embd, nr, rank, hd);
+                        gpu_rrpram_lr_backward(d_X, d_Wr, d_V, d_U, d_scores, d_dout,
+                                               d_dWr, d_dX, d_dV,
+                                               d_d_attn, d_d_score,
+                                               T, n_embd, nr, rank, hd);
+                        gpu_download(dwr, d_dWr, combined_len);
+                        gpu_download(dx,  d_dX,  T * n_embd);
+                        gpu_download(dv,  d_dV,  T * out_dim);
+                        rrlr_bw_gpu = 1;
+                    }
+                    if (d_dWr) gpu_free(d_dWr);
+                    if (d_dV)  gpu_free(d_dV);
+                }
+                if (rrlr_bw_gpu) {
+                    tape_acc_grad(e->parent1, dwr, combined_len);
+                    tape_acc_grad(e->parent2, dx,  (long)T * n_embd);
+                    tape_acc_grad(e->parent3, dv,  (long)T * out_dim);
+                    free(dwr); free(dx); free(dv);
+                    break;
+                }
+#endif
+
                 float* u_buf      = (float*)malloc(rank * sizeof(float));
                 float* du_buf     = (float*)malloc(rank * sizeof(float));
                 float* scores_buf = (float*)malloc(T_r  * sizeof(float));
@@ -2971,12 +3019,44 @@ int nt_rrpram_lowrank_attention(int wr_combined_idx, int x_idx, int v_idx,
     int rank = (int)(combined_len / ((long)nr_heads * (n_embd + T_r)));
     if (rank < 1) { nt_tensor_free(out); return -1; }
     long wra_total = (long)nr_heads * n_embd * rank;          /* offset of Wr_b section */
+
+    int rrlr_done_gpu = 0;
 #ifdef USE_CUDA
-    /* CPU-only kernel — ensure all inputs are mirrored on CPU. */
+    if (g_use_gpu) {
+        float* d_X  = nt_tensor_ensure_gpu(px->output);
+        float* d_Wr = nt_tensor_ensure_gpu(pwr->output);
+        float* d_V  = nt_tensor_ensure_gpu(pv->output);
+        float* d_O  = nt_tensor_ensure_gpu(out);
+        /* Slot map (re-using free slots beyond MH/CE backward use):
+         *   slot 1: forward-only, used by mh_attn forward — rrpram_lr never coexists.
+         *           Reuse slot 1 for d_scores [H, T, T] of rrpram.
+         *   slot 12: rrpram U buffer [H, T, R] — persisted to backward via tape.
+         *   slot 13/14: rrpram backward d_attn / d_score scratch [H, T, T].
+         * NOTE: forward U/scores must live in DEVICE buffers persisted across
+         * forward→backward boundary. tape_clear frees activation tensor d_data.
+         * Approach: cudaMalloc per-call into nt_tape entry's grad ptr is dirty.
+         * Cleaner: alloc dedicated GPU scratch and snapshot it into a dedicated
+         * tape slot. For now: backward will RECOMPUTE U and scores on GPU since
+         * they are O(T·R·H) + O(T·T·H) ≈ 8·512·512 = 2M floats — cheap recompute. */
+        int n_h = nr_heads;
+        float* d_U      = gpu_scratch(12, n_h * T * rank);
+        float* d_scores = gpu_scratch(1,  n_h * T * T);
+        if (d_X && d_Wr && d_V && d_O && d_U && d_scores) {
+            gpu_rrpram_lr_forward(d_X, d_Wr, d_V, d_O, d_U, d_scores,
+                                  T, n_embd, n_h, rank, head_dim);
+            nt_tensor_mark_gpu_fresh(out);
+            int idx = nt_tape_record4(out, NT_OP_RRPRAM_LR, wr_combined_idx, x_idx, v_idx,
+                                      (float)T, (float)n_embd, (float)nr_heads, (float)head_dim);
+            nt_tensor_free(out);
+            return idx;
+        }
+    }
+    /* CPU fallback — ensure inputs synced. */
     nt_tensor_ensure_cpu(pwr->output);
     nt_tensor_ensure_cpu(px->output);
     nt_tensor_ensure_cpu(pv->output);
 #endif
+    (void)rrlr_done_gpu;
 
     float* u_buf      = (float*)malloc(rank * sizeof(float));
     float* scores_buf = (float*)malloc(T_r  * sizeof(float));

@@ -100,6 +100,30 @@ void gpu_cross_entropy_backward(float* d_grad_logits,
                                 const float* d_logits,
                                 const float* d_targets,
                                 int T, int V);
+
+// ── RRPRAM low-rank attention (forward + backward) ────────────────
+// Wr_combined layout: [Wr_a flat | Wr_b flat]
+//   Wr_a: H*E*R floats — head h offset = h*E*R, indexed [d, r] = h*E*R + d*R + r
+//   Wr_b: H*R*T_r floats — head h offset = H*E*R + h*R*T_r, indexed [r, j]
+//   Total length = H*R*(E + T_r), assumes T_r == T
+// V: [T, H*hd] — V_h at offset h*hd with stride H*hd
+// Out: [T, H*hd]
+// d_scores_out (scratch): [H, T, T] — softmaxed scores, persisted for backward
+// d_U (scratch): [H, T, R] — U buffer for backward reuse
+void gpu_rrpram_lr_forward(
+    const float* d_X, const float* d_Wr_combined, const float* d_V,
+    float* d_out,
+    float* d_U,           /* [H, T, R] — persisted for backward */
+    float* d_scores,      /* [H, T, T] — softmaxed, persisted for backward */
+    int T, int E, int H, int R, int hd);
+
+void gpu_rrpram_lr_backward(
+    const float* d_X, const float* d_Wr_combined, const float* d_V,
+    const float* d_U, const float* d_scores,   /* from forward */
+    const float* d_dout,
+    float* d_dWr_combined, float* d_dX, float* d_dV,
+    float* d_d_attn, float* d_d_score,         /* scratch [H,T,T] */
+    int T, int E, int H, int R, int hd);
 #ifdef __cplusplus
 }
 #endif

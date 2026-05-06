@@ -656,3 +656,191 @@ extern "C" void gpu_cross_entropy_backward(float* d_grad_logits,
     float scale = 1.0f / T;
     kernel_cross_entropy_backward<<<T, 1>>>(d_grad_logits, d_logits, d_targets, T, V, scale);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// RRPRAM low-rank attention (forward + backward) — single GPU port
+// Per head h:
+//   U_h[T,R]  = X[T,E] @ Wra_h[E,R]
+//   S_h[T,T]  = U_h[T,R] @ Wrb_h[R,T]   (causal softmax applied)
+//   Out_h[T,hd] = A_h[T,T] @ V_h[T,hd]   (V_h has stride out_dim = H*hd)
+//
+// Backward (per head h):
+//   d_attn[T,T]   = dout_h[T,hd] @ V_h^T[hd,T]
+//   d_V_h[T,hd]  += A_h^T[T,T] @ dout_h[T,hd]
+//   d_score      = softmax_bwd(d_attn, A)
+//   d_U_h[T,R]   = d_score @ Wrb_h^T[T,R]
+//   d_Wrb_h[R,T]+= U_h^T[R,T] @ d_score   (causal lower-triangular)
+//   d_X[T,E]    += d_U_h @ Wra_h^T[R,E]
+//   d_Wra_h[E,R]+= X^T[E,T] @ d_U_h
+// ═══════════════════════════════════════════════════════════════════
+
+extern "C" void gpu_rrpram_lr_forward(
+    const float* d_X, const float* d_Wr_combined, const float* d_V,
+    float* d_out, float* d_U, float* d_scores,
+    int T, int E, int H, int R, int hd)
+{
+    if (!g_cublas) return;
+    long wra_total = (long)H * E * R;
+    int  out_dim = H * hd;
+    float alpha = 1.0f, beta = 0.0f;
+
+    for (int h = 0; h < H; h++) {
+        const float* Wra_h = d_Wr_combined + (long)h * E * R;          /* [E,R] row-major */
+        const float* Wrb_h = d_Wr_combined + wra_total + (long)h * R * T;/* [R,T] row-major */
+        float* U_h     = d_U + (long)h * T * R;                         /* [T,R] row-major */
+        float* S_h     = d_scores + (long)h * T * T;                    /* [T,T] row-major */
+
+        /* U_h[T,R] = X[T,E] @ Wra_h[E,R] — NN gemm */
+        gpu_sgemm_nn(T, R, E, d_X, Wra_h, U_h);
+        /* S_h[T,T] = U_h[T,R] @ Wrb_h[R,T] — NN gemm */
+        gpu_sgemm_nn(T, T, R, U_h, Wrb_h, S_h);
+    }
+
+    /* Causal softmax in-place over [H, T, T]. */
+    dim3 grid(H, T);
+    kernel_causal_softmax<<<grid, 1>>>(d_scores, T, H);
+
+    /* Out_h[T,hd] = A_h[T,T] @ V_h[T,hd]; V_h has stride out_dim = H*hd.
+     * V_h is a sub-tensor of V[T, H*hd] starting at column h*hd, ld=H*hd
+     * (row-major). Use cublasSgemm directly with strided V.
+     * Col-major view: Out_h^T(hd,T) = V_h^T(hd,T) × A_h^T(T,T). */
+    for (int h = 0; h < H; h++) {
+        const float* S_h = d_scores + (long)h * T * T;
+        const float* Vh  = d_V   + h * hd;
+        float*       Oh  = d_out + h * hd;
+        CUBLAS_CHECK(cublasSgemm(g_cublas,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            hd, T, T,
+            &alpha,
+            Vh,  out_dim,
+            S_h, T,
+            &beta,
+            Oh,  out_dim));
+    }
+}
+
+/* Softmax backward kernel (Jacobian-vector product) for general H heads.
+ * Reuses kernel_softmax_backward from MH path — same layout. */
+
+/* Helper: row-major C(M,N) = A(M,K) × B(K,N) with beta=1 (accumulate). */
+static void gpu_sgemm_nn_acc(int M, int N, int K,
+                             const float* d_A, const float* d_B, float* d_C) {
+    float alpha = 1.0f, beta = 1.0f;
+    CUBLAS_CHECK(cublasSgemm(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        d_B, N,
+        d_A, K,
+        &beta,
+        d_C, N));
+}
+
+/* Helper: row-major C(M,N) = A(M,K) × B^T(N,K) with beta. */
+static void gpu_sgemm_nt_beta(int M, int N, int K,
+                              const float* d_A, const float* d_B, float* d_C, float beta) {
+    float alpha = 1.0f;
+    CUBLAS_CHECK(cublasSgemm(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        d_B, K,
+        d_A, K,
+        &beta,
+        d_C, N));
+}
+
+/* Helper: row-major C(M,N) = A^T(K,M) × B(K,N) with beta. */
+static void gpu_sgemm_tn_beta(int M, int N, int K,
+                              const float* d_A, const float* d_B, float* d_C, float beta) {
+    float alpha = 1.0f;
+    CUBLAS_CHECK(cublasSgemm(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        N, M, K,
+        &alpha,
+        d_B, N,
+        d_A, M,
+        &beta,
+        d_C, N));
+}
+
+extern "C" void gpu_rrpram_lr_backward(
+    const float* d_X, const float* d_Wr_combined, const float* d_V,
+    const float* d_U, const float* d_scores,
+    const float* d_dout,
+    float* d_dWr_combined, float* d_dX, float* d_dV,
+    float* d_d_attn, float* d_d_score,
+    int T, int E, int H, int R, int hd)
+{
+    if (!g_cublas) return;
+    long wra_total = (long)H * E * R;
+    int  out_dim = H * hd;
+    float alpha = 1.0f, beta_acc = 1.0f, beta_zero = 0.0f;
+
+    /* zero global accumulators */
+    gpu_zero(d_dX,  (long)T * E);
+    gpu_zero(d_dV,  (long)T * out_dim);
+    gpu_zero(d_dWr_combined, wra_total + (long)H * R * T);
+
+    /* Phase 1: per-head, compute d_attn[H,T,T] (no V_h gradient yet — accumulate later)
+     * and d_V partial via softmaxed scores. */
+    for (int h = 0; h < H; h++) {
+        const float* dout_h= d_dout + h * hd;
+        const float* V_h   = d_V    + h * hd;
+        const float* S_h   = d_scores + (long)h * T * T;
+        float* d_attn_h    = d_d_attn  + (long)h * T * T;
+
+        /* d_attn_h[T,T] = dout_h[T,hd] @ V_h^T[hd,T] — row-major NT gemm with strided V_h.
+         * V_h^T is V_h transposed; V_h is [T,hd] inside V[T,H*hd] with col-stride out_dim.
+         * Direct cublas: col-major view → C^T(T,T) = V_h(T,hd) viewed col-major → V_h is
+         * column-major [hd,T] with ld=out_dim → CUBLAS_OP_N. dout_h same. */
+        CUBLAS_CHECK(cublasSgemm(g_cublas,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            T, T, hd,
+            &alpha,
+            V_h,    out_dim,
+            dout_h, out_dim,
+            &beta_zero,
+            d_attn_h, T));
+
+        /* d_V_h[T,hd] += A_h^T[T,T] × dout_h[T,hd] — strided row-major TN gemm. */
+        CUBLAS_CHECK(cublasSgemm(g_cublas,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            hd, T, T,
+            &alpha,
+            dout_h, out_dim,
+            S_h,    T,
+            &beta_acc,
+            d_dV + h * hd, out_dim));
+    }
+
+    /* Causal softmax backward across all heads. */
+    dim3 grid(H, T);
+    kernel_softmax_backward<<<grid, 1>>>(d_d_score, d_scores, d_d_attn, T, H);
+
+    /* Phase 2: per-head compute d_U_h, then dWrb_h, dWra_h, accumulate into dX.
+     * Reuse d_d_attn buffer for d_U scratch (no longer needed). */
+    for (int h = 0; h < H; h++) {
+        const float* Wra_h = d_Wr_combined + (long)h * E * R;
+        const float* Wrb_h = d_Wr_combined + wra_total + (long)h * R * T;
+        const float* U_h   = d_U      + (long)h * T * R;
+        const float* d_score_h = d_d_score + (long)h * T * T;
+        float* dWra_h = d_dWr_combined + (long)h * E * R;
+        float* dWrb_h = d_dWr_combined + wra_total + (long)h * R * T;
+
+        /* Reuse d_d_attn[h*T*T...] as d_U_h scratch (size T*R ≤ T*T). */
+        float* d_U_h_buf = d_d_attn + (long)h * T * T;
+
+        /* d_U_h[T,R] = d_score[T,T] @ Wrb_h^T[T,R] — NT gemm, beta=0 */
+        gpu_sgemm_nt_beta(T, R, T, d_score_h, Wrb_h, d_U_h_buf, 0.0f);
+
+        /* d_Wrb_h[R,T] += U_h^T[R,T] @ d_score[T,T] — TN gemm, beta=1 */
+        gpu_sgemm_tn_beta(R, T, T, U_h, d_score_h, dWrb_h, 1.0f);
+
+        /* d_X[T,E] += d_U_h[T,R] @ Wra_h^T[R,E] — NT gemm, beta=1 */
+        gpu_sgemm_nt_beta(T, E, R, d_U_h_buf, Wra_h, d_dX, 1.0f);
+
+        /* d_Wra_h[E,R] += X^T[E,T] @ d_U_h[T,R] — TN gemm, beta=1 */
+        gpu_sgemm_tn_beta(E, R, T, d_X, d_U_h_buf, dWra_h, 1.0f);
+    }
+}
