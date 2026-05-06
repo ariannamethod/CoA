@@ -10,6 +10,24 @@ endif
 
 all: coa coa_v1_janus
 
+# CUDA build target — links cuBLAS + cudart + ariannamethod GPU kernels.
+# notorch.c includes notorch_cuda.h under #ifdef USE_CUDA; dispatch wiring
+# in tape ops is the active port (commit-by-commit).
+NVCC ?= nvcc
+CUDA_CFLAGS  = -O3 -DUSE_CUDA -I.
+CUDA_LDFLAGS = -lcublas -lcudart -lcuda
+
+notorch_cuda.o: notorch_cuda.cu notorch_cuda.h
+	$(NVCC) $(CUDA_CFLAGS) -c notorch_cuda.cu -o notorch_cuda.o
+
+cuda: coa_v1_janus.c notorch.c notorch.h notorch_cuda.h notorch_cuda.cu loragrad.c loragrad.h
+	$(NVCC) $(CUDA_CFLAGS) -c notorch_cuda.cu -o notorch_cuda.o
+	$(CC) $(CFLAGS) -DUSE_CUDA -DUSE_BLAS -c notorch.c -o notorch_cuda_host.o
+	$(CC) $(CFLAGS) -DUSE_CUDA -c loragrad.c -o loragrad_cuda.o
+	$(CC) $(CFLAGS) -DUSE_CUDA -c coa_v1_janus.c -o coa_v1_janus_cuda.o
+	$(CC) coa_v1_janus_cuda.o notorch_cuda_host.o notorch_cuda.o loragrad_cuda.o \
+	      $(LDFLAGS) $(CUDA_LDFLAGS) -lopenblas -o coa_v1_janus_cuda
+
 notorch.o: notorch.c notorch.h
 	$(CC) $(CFLAGS) -c notorch.c -o notorch.o
 
@@ -41,6 +59,7 @@ run-v1: coa_v1_janus
 	./coa_v1_janus origin.txt
 
 clean:
-	rm -f coa coa.o coa_v1_janus coa_v1_janus.o notorch.o loragrad.o bpe_encode
+	rm -f coa coa.o coa_v1_janus coa_v1_janus.o notorch.o loragrad.o bpe_encode \
+	      coa_v1_janus_cuda coa_v1_janus_cuda.o notorch_cuda.o notorch_cuda_host.o loragrad_cuda.o
 
 .PHONY: all run run-v1 clean
