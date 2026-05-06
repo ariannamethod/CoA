@@ -62,35 +62,43 @@ int nt_get_gpu_mode(void) { return g_use_gpu; }
 #ifdef USE_CUDA
 // Lazy upload: ensure t->d_data is allocated and contains current CPU values.
 // If gpu_valid == 1 the GPU buffer is up to date and no transfer happens.
+// If cpu_dirty == 1 the GPU is the source of truth — caller already wrote
+// there. Do not overwrite it with stale CPU data.
 static float* nt_tensor_ensure_gpu(nt_tensor* t) {
     if (!t || t->len <= 0) return NULL;
     if (!t->d_data) {
         t->d_data = gpu_alloc(t->len);
         t->gpu_valid = 0;
     }
-    if (!t->gpu_valid && t->d_data) {
+    if (!t->gpu_valid && !t->cpu_dirty && t->d_data) {
         gpu_upload(t->d_data, t->data, t->len);
         t->gpu_valid = 1;
     }
     return t->d_data;
 }
 
-// After a GPU forward op writes d_data, mirror back to CPU so any
-// non-GPU-wired downstream op (RoPE, embedding, scale, etc.) sees correct
-// data without per-call instrumentation. Sets gpu_valid=1 so subsequent
-// GPU reads skip the upload. v1 trade-off: eager download costs a transfer
-// per GPU op; v1.5 should keep activations resident and only sync at CPU-
-// op boundaries.
-static void nt_tensor_sync_to_cpu(nt_tensor* t) {
-    if (!t || !t->d_data) return;
+// Lazy download: pull GPU data into CPU mirror only if a CPU op needs it.
+// Called at the start of any CPU-only op that reads tensor data.
+static void nt_tensor_ensure_cpu(nt_tensor* t) {
+    if (!t || !t->d_data || !t->cpu_dirty) return;
     gpu_download(t->data, t->d_data, t->len);
-    t->gpu_valid = 1;
+    t->cpu_dirty = 0;
 }
 
-// Mark CPU as authoritative (e.g. after Chuck step on CPU).
+// Mark a tensor as freshly written by a GPU kernel: GPU is source of truth,
+// CPU mirror is stale. Avoids the eager D2H copy of v1 dispatch (one transfer
+// per op was killing throughput more than the kernels saved).
+static void nt_tensor_mark_gpu_fresh(nt_tensor* t) {
+    if (!t) return;
+    t->gpu_valid = 1;
+    t->cpu_dirty = 1;
+}
+
+// Mark CPU as authoritative (e.g. after Chuck step on CPU writes weights).
 static void nt_tensor_mark_cpu_dirty(nt_tensor* t) {
     if (!t) return;
     t->gpu_valid = 0;  /* next ensure_gpu re-uploads */
+    t->cpu_dirty = 0;  /* CPU is now the source of truth */
 }
 #endif
 
@@ -440,6 +448,21 @@ static void tape_acc_grad(int idx, const float* grad, int len) {
 
 void nt_tape_backward(int loss_idx) {
     if (loss_idx < 0 || loss_idx >= g_tape.count) return;
+
+#ifdef USE_CUDA
+    /* Forward kept activations resident on GPU (lazy-sync model). Backward
+     * has scattered CPU paths (silu_bwd, rmsnorm_bwd, mul_bwd, etc.) that
+     * dereference px->output->data directly. Pull all dirty mirrors down
+     * once here so each CPU case is correct without per-op instrumentation.
+     * Cost: one D2H per resident activation. Avoids per-op transfers
+     * which are individually small but kernel-launch dominated. */
+    if (g_use_gpu) {
+        for (int i = 0; i <= loss_idx && i < g_tape.count; i++) {
+            nt_tape_entry* e = &g_tape.entries[i];
+            if (e->output) nt_tensor_ensure_cpu(e->output);
+        }
+    }
+#endif
 
     nt_tape_entry* loss = &g_tape.entries[loss_idx];
     if (!loss->grad) loss->grad = nt_tensor_new(loss->output->len);
@@ -2301,6 +2324,10 @@ int nt_seq_embedding(int wte_idx, int wpe_idx, int tokens_idx, int T, int D) {
 
     nt_tensor* out = nt_tensor_new(T * D);
     if (!out) return -1;
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu(wte->output);
+    nt_tensor_ensure_cpu(tok->output);
+#endif
     for (int t = 0; t < T; t++) {
         int tid = (int)tok->output->data[t];
         if (tid < 0) tid = 0;
@@ -2367,7 +2394,7 @@ int nt_seq_linear(int w_idx, int x_idx, int T) {
         float* d_Y = nt_tensor_ensure_gpu(out);
         if (d_X && d_W && d_Y) {
             gpu_sgemm_nt(T, out_dim, in_dim, d_X, d_W, d_Y);
-            nt_tensor_sync_to_cpu(out);  /* keep CPU mirror coherent for non-GPU ops */
+            nt_tensor_mark_gpu_fresh(out);  /* keep CPU mirror coherent for non-GPU ops */
             done_gpu = 1;
         }
     }
@@ -2422,7 +2449,7 @@ int nt_seq_linear_t(int w_idx, int x_idx, int T) {
         float* d_Y = nt_tensor_ensure_gpu(out);
         if (d_X && d_W && d_Y) {
             gpu_sgemm_nn(T, W_cols, W_rows, d_X, d_W, d_Y);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
     }
@@ -2498,7 +2525,7 @@ int nt_seq_rmsnorm(int x_idx, int gamma_idx, int T, int D) {
         float* d_Y = nt_tensor_ensure_gpu(out);
         if (d_X && d_Y) {
             gpu_rmsnorm(d_Y, d_X, T, D);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
     }
@@ -2516,12 +2543,17 @@ int nt_seq_rmsnorm(int x_idx, int gamma_idx, int T, int D) {
 
     if (gamma_idx >= 0 && gamma_idx < g_tape.count) {
         nt_tape_entry* pg = &g_tape.entries[gamma_idx];
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(out);
+        nt_tensor_ensure_cpu(pg->output);
+#endif
         for (int t = 0; t < T; t++)
             for (int d = 0; d < D && d < pg->output->len; d++)
                 out->data[t * D + d] *= pg->output->data[d];
 #ifdef USE_CUDA
         /* CPU was just modified after gamma scale — invalidate GPU mirror. */
         out->gpu_valid = 0;
+        out->cpu_dirty = 0;
 #endif
     }
 
@@ -2545,7 +2577,7 @@ int nt_silu(int x_idx) {
         float* d_Y = nt_tensor_ensure_gpu(out);
         if (d_X && d_Y) {
             gpu_silu(d_Y, d_X, n);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
     }
@@ -2698,7 +2730,7 @@ int nt_mh_causal_attention(int q_idx, int k_idx, int v_idx, int T, int head_dim)
         float* d_scores = gpu_scratch(1, n_heads * T * T);
         if (d_Q && d_K && d_V && d_Y && d_scores) {
             gpu_multi_head_attention(d_Q, d_K, d_V, d_Y, d_scores, T, D, n_heads);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             int idx = nt_tape_record3(out, NT_OP_MH_CAUSAL_ATTN, q_idx, k_idx, v_idx, (float)T, (float)head_dim);
             nt_tensor_free(out);
             return idx;
@@ -2857,6 +2889,12 @@ int nt_rrpram_lowrank_attention(int wr_combined_idx, int x_idx, int v_idx,
     int rank = (int)(combined_len / ((long)nr_heads * (n_embd + T_r)));
     if (rank < 1) { nt_tensor_free(out); return -1; }
     long wra_total = (long)nr_heads * n_embd * rank;          /* offset of Wr_b section */
+#ifdef USE_CUDA
+    /* CPU-only kernel — ensure all inputs are mirrored on CPU. */
+    nt_tensor_ensure_cpu(pwr->output);
+    nt_tensor_ensure_cpu(px->output);
+    nt_tensor_ensure_cpu(pv->output);
+#endif
 
     float* u_buf      = (float*)malloc(rank * sizeof(float));
     float* scores_buf = (float*)malloc(T_r  * sizeof(float));
@@ -2948,7 +2986,7 @@ int nt_swiglu(int gate_idx, int up_idx) {
         if (d_G && d_U && d_Y && d_S) {
             gpu_silu(d_S, d_G, n);
             gpu_mul(d_Y, d_S, d_U, n);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
     }
@@ -3281,12 +3319,16 @@ int nt_add(int a_idx, int b_idx) {
         float* d_Y = nt_tensor_ensure_gpu(out);
         if (d_A && d_B && d_Y) {
             gpu_add(d_Y, d_A, d_B, n);
-            nt_tensor_sync_to_cpu(out);
+            nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
     }
 #endif
     if (!done_gpu) {
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(pa->output);
+        nt_tensor_ensure_cpu(pb->output);
+#endif
         for (int i = 0; i < n; i++)
             out->data[i] = pa->output->data[i] + pb->output->data[i % pb->output->len];
     }
@@ -3302,6 +3344,10 @@ int nt_mul(int a_idx, int b_idx) {
     int n = pa->output->len;
     nt_tensor* out = nt_tensor_new(n);
     if (!out) return -1;
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu(pa->output);
+    nt_tensor_ensure_cpu(pb->output);
+#endif
     for (int i = 0; i < n; i++)
         out->data[i] = pa->output->data[i] * pb->output->data[i % pb->output->len];
     int idx = nt_tape_record(out, NT_OP_MUL, a_idx, b_idx, 0);
@@ -3315,6 +3361,9 @@ int nt_scale(int x_idx, float s) {
     int n = px->output->len;
     nt_tensor* out = nt_tensor_new(n);
     if (!out) return -1;
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu(px->output);
+#endif
     for (int i = 0; i < n; i++) out->data[i] = px->output->data[i] * s;
     int idx = nt_tape_record(out, NT_OP_SCALE, x_idx, -1, s);
     nt_tensor_free(out);
@@ -3330,6 +3379,9 @@ int nt_rope_freq(int x_idx, int T, int head_dim, float freq_base) {
     int n_heads = D / head_dim;
     if (n_heads <= 0) return -1;
 
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu(px->output);
+#endif
     nt_tensor* out = nt_tensor_clone(px->output);
     if (!out) return -1;
 

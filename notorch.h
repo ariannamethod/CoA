@@ -34,7 +34,8 @@ typedef struct {
     int      refcount;
 #ifdef USE_CUDA
     float*   d_data;            // GPU device pointer
-    int      gpu_valid;         // 1 = GPU copy is current
+    int      gpu_valid;         // 1 = GPU copy is up to date with last write
+    int      cpu_dirty;         // 1 = GPU was last writer, CPU mirror stale, needs ensure_cpu
 #endif
 } nt_tensor;
 

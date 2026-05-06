@@ -15,18 +15,18 @@ all: coa coa_v1_janus
 # in tape ops is the active port (commit-by-commit).
 NVCC ?= nvcc
 CUDA_CFLAGS  = -O3 -DUSE_CUDA -I.
-CUDA_LDFLAGS = -lcublas -lcudart -lcuda
+CUDA_LDFLAGS = -L/usr/local/cuda/lib64 -lcublas -lcudart -lcuda
 
 notorch_cuda.o: notorch_cuda.cu notorch_cuda.h
 	$(NVCC) $(CUDA_CFLAGS) -c notorch_cuda.cu -o notorch_cuda.o
 
 cuda: coa_v1_janus.c notorch.c notorch.h notorch_cuda.h notorch_cuda.cu loragrad.c loragrad.h
 	$(NVCC) $(CUDA_CFLAGS) -c notorch_cuda.cu -o notorch_cuda.o
-	$(CC) $(CFLAGS) -DUSE_CUDA -DUSE_BLAS -c notorch.c -o notorch_cuda_host.o
+	$(CC) $(CFLAGS) -DUSE_CUDA -c notorch.c -o notorch_cuda_host.o
 	$(CC) $(CFLAGS) -DUSE_CUDA -c loragrad.c -o loragrad_cuda.o
 	$(CC) $(CFLAGS) -DUSE_CUDA -c coa_v1_janus.c -o coa_v1_janus_cuda.o
 	$(CC) coa_v1_janus_cuda.o notorch_cuda_host.o notorch_cuda.o loragrad_cuda.o \
-	      $(LDFLAGS) $(CUDA_LDFLAGS) -lopenblas -o coa_v1_janus_cuda
+	      $(LDFLAGS) $(CUDA_LDFLAGS) -o coa_v1_janus_cuda
 
 notorch.o: notorch.c notorch.h
 	$(CC) $(CFLAGS) -c notorch.c -o notorch.o

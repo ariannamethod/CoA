@@ -11,7 +11,7 @@
 #include <string.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include "ariannamethod_cuda.h"
+#include "notorch_cuda.h"
 
 // ═══════════════════════════════════════════════════════════════════
 // Globals
