@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <float.h>
+#include <sys/time.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BLAS BACKEND
@@ -476,7 +477,7 @@ void nt_tape_backward(int loss_idx) {
         if (!e->grad) continue;
         float* dout = e->grad->data;
         int out_len = e->output->len;
-        struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+        struct timeval ts0; gettimeofday(&ts0, NULL);
 
         switch (e->op) {
 
@@ -1883,8 +1884,8 @@ void nt_tape_backward(int loss_idx) {
         default:
             break;
         }
-        struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
-        double el = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+        struct timeval ts1; gettimeofday(&ts1, NULL);
+        double el = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_usec - ts0.tv_usec) / 1000.0;
         int op = e->op;
         if (op >= 0 && op < 64) { bw_op_ms[op] += el; bw_op_cnt[op]++; }
     }
