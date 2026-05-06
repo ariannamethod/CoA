@@ -2392,6 +2392,12 @@ int nt_seq_linear(int w_idx, int x_idx, int T) {
         float* d_X = nt_tensor_ensure_gpu(px->output);
         float* d_W = nt_tensor_ensure_gpu(pw->output);
         float* d_Y = nt_tensor_ensure_gpu(out);
+        static int dbg_seq_lin = 0;
+        if (dbg_seq_lin < 8) {
+            fprintf(stderr, "[GPU-DBG] seq_linear T=%d in=%d out=%d  d_X=%p d_W=%p d_Y=%p\n",
+                    T, in_dim, out_dim, (void*)d_X, (void*)d_W, (void*)d_Y);
+            dbg_seq_lin++;
+        }
         if (d_X && d_W && d_Y) {
             gpu_sgemm_nt(T, out_dim, in_dim, d_X, d_W, d_Y);
             nt_tensor_mark_gpu_fresh(out);  /* keep CPU mirror coherent for non-GPU ops */
