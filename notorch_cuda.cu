@@ -743,11 +743,16 @@ __global__ void kernel_cross_entropy_backward(float* grad_logits,
 extern "C" float gpu_cross_entropy(const float* d_logits, const float* d_targets,
                                     float* d_losses, int T, int V) {
     kernel_cross_entropy_forward<<<T, 1>>>(d_logits, d_targets, d_losses, T, V);
-    float* h_losses = (float*)malloc(T * sizeof(float));
-    gpu_download(h_losses, d_losses, T);
-    float total = 0;
-    for (int t = 0; t < T; t++) total += h_losses[t];
-    free(h_losses);
+    /* Reduce on GPU via cuBLAS Sasum (Σ |x|; losses are ≥ 0 so this is a sum). */
+    float total = 0.0f;
+    if (g_cublas) {
+        CUBLAS_CHECK(cublasSasum(g_cublas, T, d_losses, 1, &total));
+    } else {
+        float* h_losses = (float*)malloc(T * sizeof(float));
+        gpu_download(h_losses, d_losses, T);
+        for (int t = 0; t < T; t++) total += h_losses[t];
+        free(h_losses);
+    }
     return total / T;
 }
 
