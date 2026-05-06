@@ -100,19 +100,110 @@ extern "C" void gpu_shutdown(void) {
 // Memory management
 // ═══════════════════════════════════════════════════════════════════
 
+/* Free-list cache: avoid cudaMalloc/cudaFree on every tape clear.
+ * Bucketize by next-power-of-two size class. Track each cached buffer's
+ * size via a parallel array so gpu_free can find the bucket from the ptr
+ * (linear scan, but bounded by cache capacity ~448 entries).
+ */
+#define GPU_CACHE_BUCKETS 28        /* up to 2^27 floats = 512 MB single tensor */
+#define GPU_CACHE_PER_BUCKET 32
+typedef struct {
+    float* slots[GPU_CACHE_PER_BUCKET];
+    int    count;
+} gpu_cache_bucket;
+static gpu_cache_bucket g_alloc_cache[GPU_CACHE_BUCKETS];
+
+/* Side table: ptr → bucket. Bounded fixed-size open-addressed hash table.
+ * 4096 slots is far more than realistic concurrent live alloc count. */
+#define GPU_PTR_MAP_SIZE 8192
+typedef struct {
+    float* ptr;
+    int    bucket;
+} gpu_ptr_entry;
+static gpu_ptr_entry g_ptr_map[GPU_PTR_MAP_SIZE];
+
+static unsigned gpu_ptr_hash(float* p) {
+    unsigned long long u = (unsigned long long)p;
+    u = (u >> 7) * 11400714819323198485ULL;
+    return (unsigned)(u >> 32) & (GPU_PTR_MAP_SIZE - 1);
+}
+
+static void gpu_ptr_map_set(float* p, int bucket) {
+    unsigned h = gpu_ptr_hash(p);
+    for (int i = 0; i < GPU_PTR_MAP_SIZE; i++) {
+        unsigned idx = (h + i) & (GPU_PTR_MAP_SIZE - 1);
+        if (g_ptr_map[idx].ptr == NULL || g_ptr_map[idx].ptr == p) {
+            g_ptr_map[idx].ptr = p;
+            g_ptr_map[idx].bucket = bucket;
+            return;
+        }
+    }
+    fprintf(stderr, "[GPU] ptr_map full — buffer leak\n");
+}
+
+static int gpu_ptr_map_get_and_clear(float* p) {
+    unsigned h = gpu_ptr_hash(p);
+    for (int i = 0; i < GPU_PTR_MAP_SIZE; i++) {
+        unsigned idx = (h + i) & (GPU_PTR_MAP_SIZE - 1);
+        if (g_ptr_map[idx].ptr == p) {
+            int b = g_ptr_map[idx].bucket;
+            g_ptr_map[idx].ptr = NULL;
+            g_ptr_map[idx].bucket = -1;
+            return b;
+        }
+        if (g_ptr_map[idx].ptr == NULL) return -1;
+    }
+    return -1;
+}
+
+static int gpu_cache_bucket_for(int n) {
+    int b = 0;
+    int v = 1;
+    while (v < n && b < GPU_CACHE_BUCKETS - 1) { v <<= 1; b++; }
+    return b;
+}
+
 extern "C" float* gpu_alloc(int n) {
+    int b = gpu_cache_bucket_for(n);
+    if (b < GPU_CACHE_BUCKETS && g_alloc_cache[b].count > 0) {
+        float* p = g_alloc_cache[b].slots[--g_alloc_cache[b].count];
+        gpu_ptr_map_set(p, b);
+        return p;
+    }
+    /* Round up alloc to next pow2 so any future alloc with same bucket fits. */
+    int alloc_n = 1; while (alloc_n < n) alloc_n <<= 1;
+    if (alloc_n < n) alloc_n = n;
     float* d_ptr = NULL;
-    cudaError_t err = cudaMalloc(&d_ptr, n * sizeof(float));
+    cudaError_t err = cudaMalloc(&d_ptr, (size_t)alloc_n * sizeof(float));
     if (err != cudaSuccess) {
         fprintf(stderr, "[GPU] alloc failed: %s (%d floats = %.1f MB)\n",
                 cudaGetErrorString(err), n, n * 4.0f / 1e6);
         return NULL;
     }
+    gpu_ptr_map_set(d_ptr, b);
     return d_ptr;
 }
 
 extern "C" void gpu_free(float* d_ptr) {
-    if (d_ptr) cudaFree(d_ptr);
+    if (!d_ptr) return;
+    int bucket = gpu_ptr_map_get_and_clear(d_ptr);
+    if (bucket < 0 || bucket >= GPU_CACHE_BUCKETS) {
+        cudaFree(d_ptr);
+        return;
+    }
+    if (g_alloc_cache[bucket].count < GPU_CACHE_PER_BUCKET) {
+        g_alloc_cache[bucket].slots[g_alloc_cache[bucket].count++] = d_ptr;
+        return;
+    }
+    cudaFree(d_ptr);
+}
+
+extern "C" void gpu_alloc_cache_clear(void) {
+    for (int b = 0; b < GPU_CACHE_BUCKETS; b++) {
+        for (int i = 0; i < g_alloc_cache[b].count; i++)
+            cudaFree(g_alloc_cache[b].slots[i]);
+        g_alloc_cache[b].count = 0;
+    }
 }
 
 extern "C" void gpu_upload(float* d_dst, const float* h_src, int n) {
