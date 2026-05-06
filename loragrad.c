@@ -144,8 +144,12 @@ int lg_field_init(lg_field_t* f, int n_experts, uint64_t seed) {
         return -2;
     }
 
-    f->thresh_pass   =  0.40f;
-    f->thresh_weaken =  0.10f;
+    /* Tuned 2026-05-06: DoE corpus origin·boundary = +0.34 (modest separation);
+     * sample scores cluster in +0.10..+0.30 range. Original +0.40 pass
+     * threshold gave 0 PASS verdicts in CoA Phase-1 smoke. Lowered to +0.20
+     * to allow real PASS flow without flattening the verdict cascade. */
+    f->thresh_pass   =  0.20f;
+    f->thresh_weaken =  0.05f;
     f->thresh_freeze = -0.10f;
     f->thresh_scar   =  0.25f;
     f->thresh_dark   =  0.50f;

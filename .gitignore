@@ -1,0 +1,14 @@
+# build artifacts
+*.o
+coa
+coa_v1_janus
+bpe_encode
+
+# datasets, weights, runs — never in git
+datasets/
+weights/
+runs/
+*.tokens
+*.bin
+*.gguf
+*.npz

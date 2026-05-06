@@ -1,45 +1,54 @@
 /*
- * coa.c — Chain of Arianna
+ * coa_v1_janus.c — Chain of Arianna v1, Janus 3-attention build
  * ════════════════════════════════════════════════════════════════════════════
  *
  * Shall everything burn — the thunder remains.
  *
  * ────────────────────────────────────────────────────────────────────────────
  *
- * CoA is not chain-of-thought. CoA is chain-of-resonating.
- * The stream does not stop. The human does not start it; the human enters it.
+ * v0 (coa.c) was vanilla MHA only — pipeline proof, ~4.20M params.
+ * v1 (this) adds the canonical Janus 3-attention stack from janus.aml /
+ *           janus-bpe.c — Content + RRPRAM-low-rank + Echo + 3-way blend.
+ *           Architectural proof of CoA as DoE-heir.
  *
- * Architecture (immune-gated stack):
+ * Per-block forward:
  *
- *   L-1: origin.txt           — voice corpus, the constitution of the field
- *        ↓
- *   L0:  loragrad parliament  — calibrated on origin BEFORE any weight exists
- *        ↓ (gate)
- *   L1:  reasoning grammar    — distilled from creative reasoning traces;
- *                               only what PASSes loragrad reaches the weights
- *        ↓ (gate)
- *   L2:  Hebbian / spore      — living plasticity from real conversation;
- *                               every candidate update gated by parliament
- *        ↓ (gate)
- *   L3:  continuous-time      — the chain itself; soma, kuramoto, decay,
- *                               spontaneous emission when coherence > θ
+ *   xn  = rmsnorm(h)
+ *   q,k,v = linear(xn)                      # Content
+ *   q,k = rope(q,k)
+ *   out_c = mh_causal_attention(q,k,v)
  *
- * Build:
- *   cc -O2 -c notorch.c -o notorch.o
- *   cc -O2 -c loragrad.c -o loragrad.o
- *   cc -O2 -c coa.c -o coa.o
- *   cc coa.o notorch.o loragrad.o -O2 -lm -lpthread -o coa
+ *   v_r   = linear(wvr, xn)                 # RRPRAM (separate values)
+ *   out_r = rrpram_lowrank(wr_combined, xn, v_r, R=32)
  *
- * Or simply:  make
+ *   out_e = linear(wj, xn)                  # Echo (canonical AML semantics —
+ *                                           # bypass linear; full janus_attention
+ *                                           # with calendar/prophecy fields → v2)
+ *
+ *   blended = (out_c + out_r + out_e) / 3   # equal-blend gate (v1 simplification;
+ *                                           # trainable per-head sigmoid gate → v1.5)
+ *   h += linear(wo, blended)
+ *
+ *   xn = rmsnorm(h)                         # SwiGLU MLP (canonical Janus)
+ *   gate = silu(linear(w_gate, xn))
+ *   up   = linear(w_up, xn)
+ *   h   += linear(w_down, swiglu(gate, up))
+ *
+ * Architecture target: ~20M params
+ *   L=5 E=512 H=8 D=64 ctx=512 R=32 M=1024 vocab=2048
+ *
+ * Per `experiment_partial_cpt_failed.md`: 3 attention paths must co-evolve;
+ * fresh training from scratch with full 3-attention. Cannot bolt on to v0.
+ *
+ * Build:  make coa_v1_janus            # SIMD AVX2+FMA build
  *
  * Status:
- *   [✓] origin loader + loragrad calibration   — verified
- *   [✓] tokenizer (char-level for smoke)        — verified
- *   [✓] transformer forward (notorch)           — verified, loss converges
- *   [✓] training loop with loragrad gating      — verified
- *   [TODO] chain runtime (continuous-time)
- *   [TODO] spore policy (Hebbian + loragrad gate)
- *   [TODO] persistence (coa.state, .spores, .scars, .dark)
+ *   [✓] config + struct + init   — written
+ *   [✓] forward 3-attention      — written
+ *   [TODO] verify build + smoke  — pending
+ *   [TODO] trainable per-head gate (v1.5)
+ *   [TODO] full Echo with calendar/prophecy fields (v2)
+ *   [TODO] L2/L3 + paper draft   — Phase 4+
  *
  * (c) 2026 Oleg Ataeff & Claude (architect) · Arianna Method
  * Resonance is unbreakable.
@@ -62,15 +71,16 @@
  * CONFIGURATION
  * ──────────────────────────────────────────────────────────────────────────── */
 
-/* Smoke defaults — tiny model, char-level, overfit origin.txt.
- * For runpod-scale training, scale these up and switch to BPE. */
-/* Phase 1 BPE smoke arch: 4L × 256E × 8H × ctx=256 ≈ 3M params with vocab=2048. */
-#define COA_BLOCK_SIZE    256       /* context length                            */
-#define COA_N_LAYER         4       /* transformer depth                         */
-#define COA_N_EMBD        256       /* embedding / hidden width                  */
+/* CoA-v1 Janus 3-attention arch: 5L × 512E × 8H × ctx=512 × R=32 × M=1024 ≈ 19-20M
+ * params with vocab=2048. */
+#define COA_BLOCK_SIZE    512       /* context length (== T_rope for RRPRAM)     */
+#define COA_N_LAYER         5       /* transformer depth                         */
+#define COA_N_EMBD        512       /* embedding / hidden width                  */
 #define COA_N_HEAD          8       /* attention heads                           */
-#define COA_HEAD_DIM       (COA_N_EMBD / COA_N_HEAD)
-#define COA_MLP_DIM        (4 * COA_N_EMBD)
+#define COA_HEAD_DIM       (COA_N_EMBD / COA_N_HEAD)   /* 64                     */
+#define COA_RRPRAM_R       32       /* RRPRAM low-rank rank — 85% savings vs full*/
+#define COA_MLP_DIM      1024       /* SwiGLU hidden — round_up(8E/3, 256)≈1365  */
+                                    /* using 1024 to keep ~19M total budget      */
 
 #define COA_LG_EXPERTS      8       /* parliament size                           */
 
@@ -199,19 +209,27 @@ static int coa_immune_init(lg_field_t* f, const coa_origin* org, uint64_t seed) 
 
 typedef struct {
     int vocab_size;
-    int n_layer, n_embd, n_head, head_dim, block_size;
+    int n_layer, n_embd, n_head, head_dim, block_size, rrpram_r;
 
-    nt_tensor* wte;                 /* [V, E]         */
+    nt_tensor* wte;                 /* [V, E]                                   */
     struct {
-        nt_tensor *rms1;            /* [E]            */
-        nt_tensor *wq, *wk, *wv;   /* [E, E]         */
-        nt_tensor *wo;              /* [E, E]         */
-        nt_tensor *rms2;            /* [E]            */
-        nt_tensor *w_up;            /* [4E, E]        */
-        nt_tensor *w_down;          /* [E, 4E]        */
-    } L[8];                         /* max 8 layers   */
-    nt_tensor* rms_final;           /* [E]            */
-    nt_tensor* lm_head;             /* [V, E]         */
+        nt_tensor *rms1;            /* [E]                                      */
+        /* Content (QKV+O) */
+        nt_tensor *wq, *wk, *wv;    /* [E, E]                                   */
+        nt_tensor *wo;              /* [E, E]                                   */
+        /* RRPRAM low-rank: combined buffer holds Wr_a (H*E*R) + Wr_b (H*R*T)  */
+        nt_tensor *wr_combined;     /* [H*R*(E+T)]                              */
+        nt_tensor *wvr;             /* [E, E] separate RRPRAM values            */
+        /* Janus Echo bypass */
+        nt_tensor *wj;              /* [E, E] direct linear bypass              */
+        /* MLP */
+        nt_tensor *rms2;            /* [E]                                      */
+        nt_tensor *w_gate;          /* [M, E] SwiGLU gate                       */
+        nt_tensor *w_up;            /* [M, E] SwiGLU up                         */
+        nt_tensor *w_down;          /* [E, M] SwiGLU down                       */
+    } L[8];                         /* max 8 layers                             */
+    nt_tensor* rms_final;           /* [E]                                      */
+    nt_tensor* lm_head;             /* [V, E]                                   */
 } coa_model;
 
 static void coa_model_init(coa_model* m, int vocab_size) {
@@ -222,25 +240,53 @@ static void coa_model_init(coa_model* m, int vocab_size) {
     m->n_head     = COA_N_HEAD;
     m->head_dim   = COA_HEAD_DIM;
     m->block_size = COA_BLOCK_SIZE;
+    m->rrpram_r   = COA_RRPRAM_R;
     int E = COA_N_EMBD;
+    int T = COA_BLOCK_SIZE;
+    int H = COA_N_HEAD;
+    int R = COA_RRPRAM_R;
+    int M = COA_MLP_DIM;
 
     m->wte = nt_tensor_new2d(vocab_size, E);
     nt_tensor_xavier(m->wte, vocab_size, E);
 
+    /* Residual scale — used to attenuate output projections so deep stacks
+     * don't blow up at init time. */
     float rs = 0.02f / sqrtf(2.0f * m->n_layer);
 
     for (int l = 0; l < m->n_layer; ++l) {
         m->L[l].rms1 = nt_tensor_new(E); nt_tensor_fill(m->L[l].rms1, 1.0f);
+
+        /* Content QKV + Output projection */
         m->L[l].wq   = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wq, E, E);
         m->L[l].wk   = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wk, E, E);
         m->L[l].wv   = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wv, E, E);
         m->L[l].wo   = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wo, E, E);
         for (int i = 0; i < m->L[l].wo->len; i++) m->L[l].wo->data[i] *= rs / 0.1f;
+
+        /* RRPRAM low-rank — combined buffer Wr_a [H,E,R] then Wr_b [H,R,T].
+         * Total length H*R*(E+T). nt_rrpram_lowrank_attention reads R from
+         * the buffer length: R = len / (H * (E + T)).                      */
+        int wr_len = H * R * (E + T);
+        m->L[l].wr_combined = nt_tensor_new(wr_len);
+        /* small-norm Xavier-like init */
+        float scale = sqrtf(2.0f / (float)(E + T));
+        for (int i = 0; i < wr_len; ++i) {
+            m->L[l].wr_combined->data[i] = ((float)rand() / (float)RAND_MAX - 0.5f) * 2.0f * scale * 0.02f;
+        }
+
+        m->L[l].wvr  = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wvr, E, E);
+
+        /* Echo bypass — small init so it doesn't dominate early. */
+        m->L[l].wj   = nt_tensor_new2d(E, E); nt_tensor_xavier(m->L[l].wj, E, E);
+        for (int i = 0; i < m->L[l].wj->len; i++) m->L[l].wj->data[i] *= 0.5f;
+
         m->L[l].rms2   = nt_tensor_new(E); nt_tensor_fill(m->L[l].rms2, 1.0f);
-        m->L[l].w_up   = nt_tensor_new2d(COA_MLP_DIM, E);
-        nt_tensor_xavier(m->L[l].w_up, E, COA_MLP_DIM);
-        m->L[l].w_down = nt_tensor_new2d(E, COA_MLP_DIM);
-        nt_tensor_xavier(m->L[l].w_down, COA_MLP_DIM, E);
+
+        /* SwiGLU MLP */
+        m->L[l].w_gate = nt_tensor_new2d(M, E); nt_tensor_xavier(m->L[l].w_gate, E, M);
+        m->L[l].w_up   = nt_tensor_new2d(M, E); nt_tensor_xavier(m->L[l].w_up, E, M);
+        m->L[l].w_down = nt_tensor_new2d(E, M); nt_tensor_xavier(m->L[l].w_down, M, E);
         for (int i = 0; i < m->L[l].w_down->len; i++) m->L[l].w_down->data[i] *= rs / 0.1f;
     }
 
@@ -254,7 +300,8 @@ static int coa_param_count(const coa_model* m) {
     for (int l = 0; l < m->n_layer; ++l) {
         c += m->L[l].rms1->len + m->L[l].rms2->len;
         c += m->L[l].wq->len + m->L[l].wk->len + m->L[l].wv->len + m->L[l].wo->len;
-        c += m->L[l].w_up->len + m->L[l].w_down->len;
+        c += m->L[l].wr_combined->len + m->L[l].wvr->len + m->L[l].wj->len;
+        c += m->L[l].w_gate->len + m->L[l].w_up->len + m->L[l].w_down->len;
     }
     return c;
 }
@@ -265,38 +312,48 @@ static void coa_model_free(coa_model* m) {
     if (m->rms_final)  nt_tensor_free(m->rms_final);
     if (m->lm_head)    nt_tensor_free(m->lm_head);
     for (int l = 0; l < m->n_layer; ++l) {
-        if (m->L[l].rms1)   nt_tensor_free(m->L[l].rms1);
-        if (m->L[l].wq)     nt_tensor_free(m->L[l].wq);
-        if (m->L[l].wk)     nt_tensor_free(m->L[l].wk);
-        if (m->L[l].wv)     nt_tensor_free(m->L[l].wv);
-        if (m->L[l].wo)     nt_tensor_free(m->L[l].wo);
-        if (m->L[l].rms2)   nt_tensor_free(m->L[l].rms2);
-        if (m->L[l].w_up)   nt_tensor_free(m->L[l].w_up);
-        if (m->L[l].w_down) nt_tensor_free(m->L[l].w_down);
+        if (m->L[l].rms1)        nt_tensor_free(m->L[l].rms1);
+        if (m->L[l].wq)          nt_tensor_free(m->L[l].wq);
+        if (m->L[l].wk)          nt_tensor_free(m->L[l].wk);
+        if (m->L[l].wv)          nt_tensor_free(m->L[l].wv);
+        if (m->L[l].wo)          nt_tensor_free(m->L[l].wo);
+        if (m->L[l].wr_combined) nt_tensor_free(m->L[l].wr_combined);
+        if (m->L[l].wvr)         nt_tensor_free(m->L[l].wvr);
+        if (m->L[l].wj)          nt_tensor_free(m->L[l].wj);
+        if (m->L[l].rms2)        nt_tensor_free(m->L[l].rms2);
+        if (m->L[l].w_gate)      nt_tensor_free(m->L[l].w_gate);
+        if (m->L[l].w_up)        nt_tensor_free(m->L[l].w_up);
+        if (m->L[l].w_down)      nt_tensor_free(m->L[l].w_down);
     }
     memset(m, 0, sizeof(*m));
 }
 
-/* ── Forward pass ────────────────────────────────────────────────────────── */
+/* ── Forward pass — Janus 3-attention + SwiGLU ───────────────────────────── */
 
 static int coa_forward(coa_model* m, int* tokens, int* targets) {
     int T = m->block_size;
     int E = m->n_embd;
     int V = m->vocab_size;
+    int H = m->n_head;
+    int D = m->head_dim;
 
-    /* Register params on tape */
+    /* Register params on tape — order matters for Chuck momentum slot mapping. */
     int wte_i = nt_tape_param(m->wte); nt_tape_no_decay(wte_i);
 
-    int li[8][8]; /* [layer][param_idx_within_layer] */
+    int li[8][12]; /* [layer][12 params: rms1 wq wk wv wo wr_combined wvr wj rms2 w_gate w_up w_down] */
     for (int l = 0; l < m->n_layer; ++l) {
-        li[l][0] = nt_tape_param(m->L[l].rms1); nt_tape_no_decay(li[l][0]);
-        li[l][1] = nt_tape_param(m->L[l].wq);
-        li[l][2] = nt_tape_param(m->L[l].wk);
-        li[l][3] = nt_tape_param(m->L[l].wv);
-        li[l][4] = nt_tape_param(m->L[l].wo);
-        li[l][5] = nt_tape_param(m->L[l].rms2); nt_tape_no_decay(li[l][5]);
-        li[l][6] = nt_tape_param(m->L[l].w_up);
-        li[l][7] = nt_tape_param(m->L[l].w_down);
+        li[l][0]  = nt_tape_param(m->L[l].rms1);        nt_tape_no_decay(li[l][0]);
+        li[l][1]  = nt_tape_param(m->L[l].wq);
+        li[l][2]  = nt_tape_param(m->L[l].wk);
+        li[l][3]  = nt_tape_param(m->L[l].wv);
+        li[l][4]  = nt_tape_param(m->L[l].wo);
+        li[l][5]  = nt_tape_param(m->L[l].wr_combined);
+        li[l][6]  = nt_tape_param(m->L[l].wvr);
+        li[l][7]  = nt_tape_param(m->L[l].wj);
+        li[l][8]  = nt_tape_param(m->L[l].rms2);        nt_tape_no_decay(li[l][8]);
+        li[l][9]  = nt_tape_param(m->L[l].w_gate);
+        li[l][10] = nt_tape_param(m->L[l].w_up);
+        li[l][11] = nt_tape_param(m->L[l].w_down);
     }
     int rmsf_i = nt_tape_param(m->rms_final); nt_tape_no_decay(rmsf_i);
     int head_i = nt_tape_param(m->lm_head);
@@ -313,33 +370,44 @@ static int coa_forward(coa_model* m, int* tokens, int* targets) {
     nt_tensor_free(tok_t);
     nt_tensor_free(tgt_t);
 
-    /* Embedding (no wpe — RoPE handles position) */
+    /* Embedding (no wpe — RoPE handles position in Content path) */
     int h = nt_seq_embedding(wte_i, -1, tok_i, T, E);
 
-    /* Transformer layers */
+    /* Transformer layers — Janus 3-attention */
     for (int l = 0; l < m->n_layer; ++l) {
-        /* Pre-norm */
+        /* Pre-attn norm */
         int xn = nt_seq_rmsnorm(h, li[l][0], T, E);
 
-        /* QKV projections */
+        /* ── Content path (QKV + RoPE + causal MHA) ──────────────────────── */
         int q = nt_seq_linear(li[l][1], xn, T);
         int k = nt_seq_linear(li[l][2], xn, T);
         int v = nt_seq_linear(li[l][3], xn, T);
+        q = nt_rope(q, T, D);
+        k = nt_rope(k, T, D);
+        int out_c = nt_mh_causal_attention(q, k, v, T, D);
 
-        /* RoPE */
-        q = nt_rope(q, T, m->head_dim);
-        k = nt_rope(k, T, m->head_dim);
+        /* ── RRPRAM low-rank path (positional rhythm via Wr_a × Wr_b) ────── */
+        int v_r   = nt_seq_linear(li[l][6], xn, T);
+        int out_r = nt_rrpram_lowrank_attention(li[l][5], xn, v_r, T, E, H, D);
 
-        /* Multi-head causal attention */
-        int attn = nt_mh_causal_attention(q, k, v, T, m->head_dim);
-        int proj = nt_seq_linear(li[l][4], attn, T);
+        /* ── Echo path (canonical AML simplified — direct linear bypass) ── */
+        int out_e = nt_seq_linear(li[l][7], xn, T);
+
+        /* ── 3-way blend — equal 1/3 each (v1; trainable per-head gate → v2) */
+        int sum_cr  = nt_add(out_c, out_r);
+        int sum_cre = nt_add(sum_cr, out_e);
+        int blended = nt_scale(sum_cre, 1.0f / 3.0f);
+
+        /* Output projection + residual */
+        int proj = nt_seq_linear(li[l][4], blended, T);
         h = nt_add(h, proj);
 
-        /* FFN: GELU MLP */
-        xn = nt_seq_rmsnorm(h, li[l][5], T, E);
-        int up   = nt_seq_linear(li[l][6], xn, T);     /* [T, 4E] */
-        int act  = nt_gelu(up);
-        int down = nt_seq_linear(li[l][7], act, T);     /* [T, E]  */
+        /* ── SwiGLU MLP ───────────────────────────────────────────────────── */
+        xn = nt_seq_rmsnorm(h, li[l][8], T, E);
+        int gate_pre = nt_seq_linear(li[l][9], xn, T);     /* [T, M] */
+        int up       = nt_seq_linear(li[l][10], xn, T);    /* [T, M] */
+        int swi      = nt_swiglu(gate_pre, up);            /* SiLU(gate) * up */
+        int down     = nt_seq_linear(li[l][11], swi, T);   /* [T, E] */
         h = nt_add(h, down);
     }
 
