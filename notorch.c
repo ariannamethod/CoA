@@ -469,11 +469,15 @@ void nt_tape_backward(int loss_idx) {
     if (!loss->grad) loss->grad = nt_tensor_new(loss->output->len);
     for (int i = 0; i < loss->grad->len; i++) loss->grad->data[i] = 1.0f;
 
+    static double bw_op_ms[64] = {0};
+    static int bw_op_cnt[64] = {0};
+    static int bw_dump = 0;
     for (int idx = loss_idx; idx >= 0; idx--) {
         nt_tape_entry* e = &g_tape.entries[idx];
         if (!e->grad) continue;
         float* dout = e->grad->data;
         int out_len = e->output->len;
+        struct timeval ts0; gettimeofday(&ts0, NULL);
 
         switch (e->op) {
 
@@ -1928,6 +1932,16 @@ void nt_tape_backward(int loss_idx) {
         default:
             break;
         }
+        struct timeval ts1; gettimeofday(&ts1, NULL);
+        double el = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_usec - ts0.tv_usec) / 1000.0;
+        int op = e->op;
+        if (op >= 0 && op < 64) { bw_op_ms[op] += el; bw_op_cnt[op]++; }
+    }
+    bw_dump++;
+    if (bw_dump == 6) {
+        fprintf(stderr, "[BW-PROFILE step6 op_ms cum]:\n");
+        for (int i = 0; i < 64; i++) if (bw_op_cnt[i])
+            fprintf(stderr, "  op=%2d cnt=%4d ms=%.1f\n", i, bw_op_cnt[i], bw_op_ms[i]);
     }
 }
 
