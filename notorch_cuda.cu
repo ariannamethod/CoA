@@ -249,6 +249,18 @@ extern "C" void gpu_axpy(float* d_y, const float* d_x, int n, float alpha) {
     CUBLAS_CHECK(cublasSaxpy(g_cublas, n, &alpha, d_x, 1, d_y, 1));
 }
 
+extern "C" float gpu_nrm2(const float* d_x, int n) {
+    if (!g_cublas || !d_x || n <= 0) return 0.0f;
+    float result = 0.0f;
+    CUBLAS_CHECK(cublasSnrm2(g_cublas, n, d_x, 1, &result));
+    return result;
+}
+
+extern "C" void gpu_sscal(float* d_x, int n, float alpha) {
+    if (!g_cublas || !d_x || n <= 0) return;
+    CUBLAS_CHECK(cublasSscal(g_cublas, n, &alpha, d_x, 1));
+}
+
 extern "C" void gpu_rmsnorm(float* d_out, const float* d_in, int T, int D) {
     int threads = D < 256 ? D : 256;
     kernel_rmsnorm<<<T, threads, threads * sizeof(float)>>>(d_out, d_in, T, D);

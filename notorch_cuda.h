@@ -143,6 +143,12 @@ void gpu_seq_rmsnorm_backward(float* d_gx, float* d_gg,
                                const float* d_grad, const float* d_x,
                                const float* d_gamma, int T, int D);
 
+// ── Reductions (cuBLAS) ──────────────────────────────────────────
+// Returns ||x||_2 (Euclidean norm) of a GPU-resident buffer.
+float gpu_nrm2(const float* d_x, int n);
+// In-place scale: x *= alpha (cuBLAS Sscal).
+void gpu_sscal(float* d_x, int n, float alpha);
+
 // ── SwiGLU ────────────────────────────────────────────────────────
 void gpu_swiglu(float* d_out, const float* d_g, const float* d_u, int n);
 void gpu_swiglu_backward(float* d_dg, float* d_du,

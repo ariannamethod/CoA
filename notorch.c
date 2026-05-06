@@ -2259,14 +2259,23 @@ void nt_tape_chuck_step(float lr, float loss_val) {
 
         int n = e->output->len;
         if (as->m->len < n) n = as->m->len;
-#ifdef USE_CUDA
-        /* Grad may have been deposited GPU-resident (cpu_dirty=1) — pull to CPU
-         * for the per-param gnorm scan + Chuck history bookkeeping. */
-        nt_tensor_ensure_cpu(e->grad);
-#endif
         float gnorm = 0.0f;
-        for (int j = 0; j < n; j++) gnorm += e->grad->data[j] * e->grad->data[j];
-        gnorm = sqrtf(gnorm);
+#ifdef USE_CUDA
+        if (g_use_gpu) {
+            float* d_g = nt_tensor_ensure_gpu(e->grad);
+            if (d_g) {
+                gnorm = gpu_nrm2(d_g, n);
+            } else {
+                nt_tensor_ensure_cpu(e->grad);
+                for (int j = 0; j < n; j++) gnorm += e->grad->data[j] * e->grad->data[j];
+                gnorm = sqrtf(gnorm);
+            }
+        } else
+#endif
+        {
+            for (int j = 0; j < n; j++) gnorm += e->grad->data[j] * e->grad->data[j];
+            gnorm = sqrtf(gnorm);
+        }
 
         cp->grad_hist[cp->pos] = gnorm;
         cp->pos = (cp->pos + 1) % NT_CHUCK_WINDOW;
@@ -2360,11 +2369,19 @@ float nt_tape_clip_grads(float max_norm) {
     for (int i = 0; i < g_tape.count; i++) {
         nt_tape_entry* e = &g_tape.entries[i];
         if (!e->is_param || !e->grad) continue;
-#ifdef USE_CUDA
-        nt_tensor_ensure_cpu(e->grad);
-#endif
         int n = e->output->len;
         if (e->grad->len < n) n = e->grad->len;
+#ifdef USE_CUDA
+        if (g_use_gpu) {
+            float* d_g = nt_tensor_ensure_gpu(e->grad);
+            if (d_g) {
+                float nrm = gpu_nrm2(d_g, n);
+                total_norm_sq += nrm * nrm;
+                continue;
+            }
+        }
+        nt_tensor_ensure_cpu(e->grad);
+#endif
         for (int j = 0; j < n; j++) {
             float g = e->grad->data[j];
             total_norm_sq += g * g;
@@ -2378,10 +2395,21 @@ float nt_tape_clip_grads(float max_norm) {
             if (!e->is_param || !e->grad) continue;
             int n = e->output->len;
             if (e->grad->len < n) n = e->grad->len;
+#ifdef USE_CUDA
+            if (g_use_gpu) {
+                float* d_g = nt_tensor_ensure_gpu(e->grad);
+                if (d_g) {
+                    gpu_sscal(d_g, n, scale);
+                    /* GPU is now source of truth — mark CPU stale so later
+                     * reads pull fresh values. */
+                    e->grad->gpu_valid = 1;
+                    e->grad->cpu_dirty = 1;
+                    continue;
+                }
+            }
+#endif
             for (int j = 0; j < n; j++) e->grad->data[j] *= scale;
 #ifdef USE_CUDA
-            /* CPU just mutated grad — invalidate GPU mirror so chuck reads
-             * scaled value. */
             e->grad->gpu_valid = 0;
             e->grad->cpu_dirty = 0;
 #endif
@@ -2533,6 +2561,21 @@ int nt_nan_guard_check(nt_nan_guard* guard) {
         nt_tape_entry* e = &g_tape.entries[i];
         if (!e->is_param || !e->grad) continue;
         int n = e->grad->len;
+#ifdef USE_CUDA
+        if (g_use_gpu) {
+            float* d_g = nt_tensor_ensure_gpu(e->grad);
+            if (d_g) {
+                /* NaN/Inf propagate through Snrm2: result = NaN if any input is NaN,
+                 * Inf if any input is Inf. Cheap O(n) GPU reduction vs CPU loop. */
+                float nrm = gpu_nrm2(d_g, n);
+                if (nrm != nrm || nrm == 1.0f/0.0f || nrm == -1.0f/0.0f) {
+                    has_nan = 1;
+                }
+                if (has_nan) break;
+                continue;
+            }
+        }
+#endif
         for (int j = 0; j < n; j++) {
             float g = e->grad->data[j];
             if (g != g || g == 1.0f/0.0f || g == -1.0f/0.0f) {  // NaN or Inf
