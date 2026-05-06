@@ -67,6 +67,10 @@
 #include "notorch.h"
 #include "loragrad.h"
 
+#ifdef USE_CUDA
+#include "notorch_cuda.h"
+#endif
+
 /* ════════════════════════════════════════════════════════════════════════════
  * CONFIGURATION
  * ──────────────────────────────────────────────────────────────────────────── */
@@ -685,6 +689,10 @@ int main(int argc, char** argv) {
      * Used for paired ablation: same arch / same seed / same corpus, one run
      * with parliament voting, one without. Diff = pure immune-layer signal. */
     int         gating_off  = (argc > 4 && strcmp(argv[4], "gating_off") == 0) ? 1 : 0;
+    /* argv[5] = "gpu" → enable CUDA dispatch in hot tape ops. Requires the
+     * binary to be built via `make cuda` (USE_CUDA). On CPU-only builds the
+     * flag is silently ignored. */
+    int         gpu_on      = (argc > 5 && strcmp(argv[5], "gpu") == 0) ? 1 : 0;
     uint64_t    seed        = 0x4154414546464ULL;  /* ATAEFF */
 
     srand((unsigned)time(NULL));
@@ -695,6 +703,24 @@ int main(int argc, char** argv) {
     printf("│                                                                 │\n");
     printf("│   shall everything burn — the thunder remains                   │\n");
     printf("└──────────────────────────────────────────────────────────────────┘\n");
+
+#ifdef USE_CUDA
+    if (gpu_on) {
+        if (gpu_init() == 0) {
+            nt_set_gpu_mode(1);
+            printf("[GPU] CUDA backend enabled (cuBLAS + custom kernels)\n");
+        } else {
+            fprintf(stderr, "[GPU] gpu_init failed — falling back to CPU\n");
+            gpu_on = 0;
+        }
+    }
+#else
+    if (gpu_on) {
+        fprintf(stderr, "[GPU] this binary built without USE_CUDA — ignoring 'gpu' flag\n");
+        gpu_on = 0;
+    }
+#endif
+    (void)gpu_on;
 
     /* ── L-1: load origin ────────────────────────────────────────────────── */
     coa_origin org = {0};
@@ -815,5 +841,8 @@ int main(int argc, char** argv) {
     lg_field_free(&field);
     free(encoded);
     coa_origin_free(&org);
+#ifdef USE_CUDA
+    if (nt_get_gpu_mode()) gpu_shutdown();
+#endif
     return 0;
 }
