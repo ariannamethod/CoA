@@ -439,7 +439,7 @@ static double coa_now_ms(void) {
 }
 
 static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
-                      int* encoded, int n_chars, int steps)
+                      int* encoded, int n_chars, int steps, int gating_off)
 {
     printf("\n══════════════════════════════════════════════════════════════════\n");
     printf("  TRAINING — char-level overfit with loragrad gradient gating\n");
@@ -505,10 +505,14 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
             lg_signature_from_text(window_text, wlen, text_sig);
         }
         float alpha = 1.0f;
-        lg_verdict_t verdict = lg_field_vote(field, text_sig, &alpha);
-        /* lg_field_record always: counters always incremented; scar/dark
-         * log already gated by verdict inside the function. */
-        lg_field_record(field, verdict, text_sig);
+        lg_verdict_t verdict;
+        if (gating_off) {
+            /* Ablation control — α=1 always, no parliament. Pure Chuck. */
+            verdict = LG_PASS;
+        } else {
+            verdict = lg_field_vote(field, text_sig, &alpha);
+            lg_field_record(field, verdict, text_sig);
+        }
         stats.total++;
 
         if (verdict == LG_PASS) {
@@ -677,6 +681,10 @@ static void coa_smoke_immune(lg_field_t* field) {
 int main(int argc, char** argv) {
     const char* origin_path = (argc > 1) ? argv[1] : "origin.txt";
     int         train_steps = (argc > 2) ? atoi(argv[2]) : COA_TRAIN_STEPS;
+    /* argv[4] = "gating_off" → ablation mode, parliament bypassed (α=1.0 always).
+     * Used for paired ablation: same arch / same seed / same corpus, one run
+     * with parliament voting, one without. Diff = pure immune-layer signal. */
+    int         gating_off  = (argc > 4 && strcmp(argv[4], "gating_off") == 0) ? 1 : 0;
     uint64_t    seed        = 0x4154414546464ULL;  /* ATAEFF */
 
     srand((unsigned)time(NULL));
@@ -780,7 +788,8 @@ int main(int argc, char** argv) {
 
     /* ── Train ───────────────────────────────────────────────────────────── */
     lg_field_reset_counters(&field);
-    coa_train(&model, &field, &bpe, encoded, n_tokens, train_steps);
+    if (gating_off) printf("[ABLATION] gating_off — parliament bypassed, pure Chuck\n");
+    coa_train(&model, &field, &bpe, encoded, n_tokens, train_steps, gating_off);
 
     /* ── Generate ────────────────────────────────────────────────────────── */
     printf("\n── generation (temp=0.8) ──\n\n");
