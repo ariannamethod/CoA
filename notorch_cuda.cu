@@ -568,37 +568,34 @@ extern "C" void gpu_multi_head_attention(
     float scale = 1.0f / sqrtf((float)head_dim);
     float beta = 0.0f;
 
-    // QK^T per head: scores_h(T,T) = Q_h(T,hd) * K_h(T,hd)^T * scale
-    // Q_h at d_Q + h*head_dim, rows stride = D
-    // In col-major: C^T(T,T) = K_h * Q_h^T
-    for (int h = 0; h < n_heads; h++) {
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            T, T, head_dim,
-            &scale,
-            d_K + h * head_dim, D,
-            d_Q + h * head_dim, D,
-            &beta,
-            d_scores + h * T * T, T));
-    }
+    // Batched QK^T: one cuBLAS call replaces n_heads launches.
+    // Per-head stride for Q/K is head_dim (col offset in row-major [T, D]).
+    // Per-head stride for scores is T*T (separate [T, T] slabs).
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        T, T, head_dim,
+        &scale,
+        d_K, D, head_dim,                  /* K_h: ld=D, stride=head_dim */
+        d_Q, D, head_dim,
+        &beta,
+        d_scores, T, (long long)T * T,
+        n_heads));
 
     // Causal softmax
     dim3 grid(n_heads, T);
     kernel_causal_softmax<<<grid, 1>>>(d_scores, T, n_heads);
 
-    // attn * V per head: out_h(T,hd) = scores_h(T,T) * V_h(T,hd)
-    // col-major: out_h^T(hd,T) = V_h^T(hd,T) * scores_h^T(T,T)
-    for (int h = 0; h < n_heads; h++) {
-        float alpha_v = 1.0f;
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            head_dim, T, T,
-            &alpha_v,
-            d_V + h * head_dim, D,
-            d_scores + h * T * T, T,
-            &beta,
-            d_out + h * head_dim, D));
-    }
+    // Batched attn * V
+    float alpha_v = 1.0f;
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        head_dim, T, T,
+        &alpha_v,
+        d_V, D, head_dim,
+        d_scores, T, (long long)T * T,
+        &beta,
+        d_out, D, head_dim,
+        n_heads));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -638,61 +635,58 @@ extern "C" void gpu_multi_head_attention_backward(
     int head_dim = D / n_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
     float alpha = 1.0f, beta = 0.0f;
+    long long S_TT = (long long)T * T;
 
-    // Step 1: d_attn_weights[h](T,T) = dout_h(T,hd) * V_h(T,hd)^T
-    for (int h = 0; h < n_heads; h++) {
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            T, T, head_dim,
-            &alpha,
-            d_V + h * head_dim, D,
-            d_dout + h * head_dim, D,
-            &beta,
-            d_scratch_TT2 + h * T * T, T));
-    }
+    // Step 1: d_attn_weights[h](T,T) = dout_h(T,hd) * V_h(T,hd)^T  (batched)
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        T, T, head_dim,
+        &alpha,
+        d_V,    D, head_dim,
+        d_dout, D, head_dim,
+        &beta,
+        d_scratch_TT2, T, S_TT,
+        n_heads));
 
     // Step 2: softmax backward
     dim3 grid(n_heads, T);
     kernel_softmax_backward<<<grid, 1>>>(d_scratch_TT, d_scores, d_scratch_TT2, T, n_heads);
 
-    // Step 3: dV_h(T,hd) = scores_h^T(T,T) * dout_h(T,hd)
+    // Step 3: dV_h(T,hd) = scores_h^T(T,T) * dout_h(T,hd)  (batched)
     gpu_zero(d_dV, T * D);
-    for (int h = 0; h < n_heads; h++) {
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            head_dim, T, T,
-            &alpha,
-            d_dout + h * head_dim, D,
-            d_scores + h * T * T, T,
-            &beta,
-            d_dV + h * head_dim, D));
-    }
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        head_dim, T, T,
+        &alpha,
+        d_dout,   D, head_dim,
+        d_scores, T, S_TT,
+        &beta,
+        d_dV,     D, head_dim,
+        n_heads));
 
-    // Step 4: dQ_h(T,hd) = grad_scores_h(T,T) * K_h(T,hd) * scale
+    // Step 4: dQ_h(T,hd) = grad_scores_h(T,T) * K_h(T,hd) * scale  (batched)
     gpu_zero(d_dQ, T * D);
-    for (int h = 0; h < n_heads; h++) {
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            head_dim, T, T,
-            &scale,
-            d_K + h * head_dim, D,
-            d_scratch_TT + h * T * T, T,
-            &beta,
-            d_dQ + h * head_dim, D));
-    }
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        head_dim, T, T,
+        &scale,
+        d_K,           D, head_dim,
+        d_scratch_TT,  T, S_TT,
+        &beta,
+        d_dQ,          D, head_dim,
+        n_heads));
 
-    // Step 5: dK_h(T,hd) = grad_scores_h^T(T,T) * Q_h(T,hd) * scale
+    // Step 5: dK_h(T,hd) = grad_scores_h^T(T,T) * Q_h(T,hd) * scale  (batched)
     gpu_zero(d_dK, T * D);
-    for (int h = 0; h < n_heads; h++) {
-        CUBLAS_CHECK(cublasSgemm(g_cublas,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            head_dim, T, T,
-            &scale,
-            d_Q + h * head_dim, D,
-            d_scratch_TT + h * T * T, T,
-            &beta,
-            d_dK + h * head_dim, D));
-    }
+    CUBLAS_CHECK(cublasSgemmStridedBatched(g_cublas,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        head_dim, T, T,
+        &scale,
+        d_Q,          D, head_dim,
+        d_scratch_TT, T, S_TT,
+        &beta,
+        d_dK,         D, head_dim,
+        n_heads));
 }
 
 // ═══════════════════════════════════════════════════════════════════
