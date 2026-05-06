@@ -2259,6 +2259,11 @@ void nt_tape_chuck_step(float lr, float loss_val) {
 
         int n = e->output->len;
         if (as->m->len < n) n = as->m->len;
+#ifdef USE_CUDA
+        /* Grad may have been deposited GPU-resident (cpu_dirty=1) — pull to CPU
+         * for the per-param gnorm scan + Chuck history bookkeeping. */
+        nt_tensor_ensure_cpu(e->grad);
+#endif
         float gnorm = 0.0f;
         for (int j = 0; j < n; j++) gnorm += e->grad->data[j] * e->grad->data[j];
         gnorm = sqrtf(gnorm);
@@ -2355,6 +2360,9 @@ float nt_tape_clip_grads(float max_norm) {
     for (int i = 0; i < g_tape.count; i++) {
         nt_tape_entry* e = &g_tape.entries[i];
         if (!e->is_param || !e->grad) continue;
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(e->grad);
+#endif
         int n = e->output->len;
         if (e->grad->len < n) n = e->grad->len;
         for (int j = 0; j < n; j++) {
@@ -2371,6 +2379,12 @@ float nt_tape_clip_grads(float max_norm) {
             int n = e->output->len;
             if (e->grad->len < n) n = e->grad->len;
             for (int j = 0; j < n; j++) e->grad->data[j] *= scale;
+#ifdef USE_CUDA
+            /* CPU just mutated grad — invalidate GPU mirror so chuck reads
+             * scaled value. */
+            e->grad->gpu_valid = 0;
+            e->grad->cpu_dirty = 0;
+#endif
         }
     }
     return total_norm;
