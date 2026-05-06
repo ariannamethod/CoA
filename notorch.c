@@ -79,12 +79,14 @@ static float* nt_tensor_ensure_gpu(nt_tensor* t) {
 }
 
 // Lazy download: pull GPU data into CPU mirror only if a CPU op needs it.
-// Called at the start of any CPU-only op that reads tensor data.
-static void nt_tensor_ensure_cpu(nt_tensor* t) {
+// CUDA-internal callers use this via direct call. Public wrapper below at
+// file scope handles CPU-only build (no-op).
+static void nt_tensor_ensure_cpu_internal(nt_tensor* t) {
     if (!t || !t->d_data || !t->cpu_dirty) return;
     gpu_download(t->data, t->d_data, t->len);
     t->cpu_dirty = 0;
 }
+#define nt_tensor_ensure_cpu nt_tensor_ensure_cpu_internal
 
 // Mark a tensor as freshly written by a GPU kernel: GPU is source of truth,
 // CPU mirror is stale. Avoids the eager D2H copy of v1 dispatch (one transfer
@@ -102,6 +104,17 @@ static void nt_tensor_mark_cpu_dirty(nt_tensor* t) {
     t->cpu_dirty = 0;  /* CPU is now the source of truth */
 }
 #endif
+
+// Public ensure-cpu — unconditionally defined. CPU-only build = no-op.
+// CUDA build = forwards to internal helper.
+#undef nt_tensor_ensure_cpu
+void nt_tensor_ensure_cpu(nt_tensor* t) {
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu_internal(t);
+#else
+    (void)t;
+#endif
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RNG

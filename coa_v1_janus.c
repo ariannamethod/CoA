@@ -817,6 +817,37 @@ int main(int argc, char** argv) {
     if (gating_off) printf("[ABLATION] gating_off — parliament bypassed, pure Chuck\n");
     coa_train(&model, &field, &bpe, encoded, n_tokens, train_steps, gating_off);
 
+    /* ── Persist weights ──────────────────────────────────────────────────── */
+    {
+        const char* weight_path = gating_off ? "coa_v1_paired_off.bin" : "coa_v1_paired_on.bin";
+        int n_params = 0;
+        nt_tensor* params[8 * 12 + 3];  /* max 8 layers × 12 params + wte + rms_final + lm_head */
+        params[n_params++] = model.wte;
+        for (int l = 0; l < model.n_layer; ++l) {
+            params[n_params++] = model.L[l].rms1;
+            params[n_params++] = model.L[l].wq;
+            params[n_params++] = model.L[l].wk;
+            params[n_params++] = model.L[l].wv;
+            params[n_params++] = model.L[l].wo;
+            params[n_params++] = model.L[l].wr_combined;
+            params[n_params++] = model.L[l].wvr;
+            params[n_params++] = model.L[l].wj;
+            params[n_params++] = model.L[l].rms2;
+            params[n_params++] = model.L[l].w_gate;
+            params[n_params++] = model.L[l].w_up;
+            params[n_params++] = model.L[l].w_down;
+        }
+        params[n_params++] = model.rms_final;
+        params[n_params++] = model.lm_head;
+        /* sync params CPU mirror (no-op if CPU-only build) */
+        for (int i = 0; i < n_params; ++i) nt_tensor_ensure_cpu(params[i]);
+        if (nt_save(weight_path, params, n_params) == 0) {
+            printf("[persist] saved %d params → %s\n", n_params, weight_path);
+        } else {
+            fprintf(stderr, "[persist] WARN: nt_save(%s) failed\n", weight_path);
+        }
+    }
+
     /* ── Generate ────────────────────────────────────────────────────────── */
     printf("\n── generation (temp=0.8) ──\n\n");
 

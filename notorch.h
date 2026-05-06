@@ -552,6 +552,10 @@ void nt_dataloader_free(nt_dataloader* dl);
 // Save N tensors to binary file. Format: [magic][n][for each: ndim, shape[], data[]]
 int nt_save(const char* path, nt_tensor** params, int n_params);
 
+// Pull GPU data into CPU mirror if cpu_dirty. No-op for CPU-only build / pure-CPU tensors.
+// Call before nt_save when training was on GPU so weights write reflects latest state.
+void nt_tensor_ensure_cpu(nt_tensor* t);
+
 // Load N tensors from binary file. Returns array of tensors (caller frees each).
 // Sets *n_params to number loaded. Returns NULL on failure.
 nt_tensor** nt_load(const char* path, int* n_params);
