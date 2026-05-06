@@ -48,6 +48,8 @@ void gpu_sgemm_tn(int M, int N, int K,
 
 void gpu_add(float* d_out, const float* d_a, const float* d_b, int n);
 void gpu_mul(float* d_out, const float* d_a, const float* d_b, int n);
+/* y[i] += alpha * x[i] — wraps cublasSaxpy. */
+void gpu_axpy(float* d_y, const float* d_x, int n, float alpha);
 void gpu_silu(float* d_out, const float* d_in, int n);
 void gpu_rmsnorm(float* d_out, const float* d_in, int T, int D);
 

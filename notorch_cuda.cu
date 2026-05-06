@@ -244,6 +244,11 @@ extern "C" void gpu_silu(float* d_out, const float* d_in, int n) {
     kernel_silu<<<gpu_blocks(n, 256), 256>>>(d_out, d_in, n);
 }
 
+extern "C" void gpu_axpy(float* d_y, const float* d_x, int n, float alpha) {
+    if (!g_cublas) return;
+    CUBLAS_CHECK(cublasSaxpy(g_cublas, n, &alpha, d_x, 1, d_y, 1));
+}
+
 extern "C" void gpu_rmsnorm(float* d_out, const float* d_in, int T, int D) {
     int threads = D < 256 ? D : 256;
     kernel_rmsnorm<<<T, threads, threads * sizeof(float)>>>(d_out, d_in, T, D);

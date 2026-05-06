@@ -439,9 +439,45 @@ static void tape_acc_grad(int idx, const float* grad, int len) {
         e->grad = nt_tensor_new(len);
         if (!e->grad) return;
     }
+#ifdef USE_CUDA
+    /* If GPU is the source of truth for e->grad, sync to CPU first so this
+     * CPU contribution lands on the latest accumulated value. */
+    nt_tensor_ensure_cpu(e->grad);
+#endif
     int n = e->grad->len < len ? e->grad->len : len;
     for (int i = 0; i < n; i++) e->grad->data[i] += grad[i];
+#ifdef USE_CUDA
+    /* CPU just modified — invalidate GPU mirror. */
+    e->grad->gpu_valid = 0;
+    e->grad->cpu_dirty = 0;
+#endif
 }
+
+#ifdef USE_CUDA
+/* Accumulate a GPU-resident contribution into e->grad's GPU buffer.
+ * If e->grad doesn't have GPU storage yet, allocate + zero. If e->grad
+ * is currently CPU-fresh, upload the existing CPU values first so the
+ * GPU buffer sees full accumulated state, then axpy. */
+static void tape_acc_grad_gpu(int idx, const float* d_grad, int len) {
+    if (idx < 0 || idx >= g_tape.count) return;
+    nt_tape_entry* e = &g_tape.entries[idx];
+    if (e->frozen) return;
+    if (!e->grad) {
+        e->grad = nt_tensor_new(len);
+        if (!e->grad) return;
+    }
+    int n = e->grad->len < len ? e->grad->len : len;
+    /* Ensure GPU buffer exists and contains current CPU state. */
+    float* d_dst = nt_tensor_ensure_gpu(e->grad);
+    if (!d_dst) return;
+    /* Use cuBLAS axpy: dst += d_grad. */
+    extern void gpu_axpy(float* d_y, const float* d_x, int n, float alpha);
+    gpu_axpy(d_dst, d_grad, n, 1.0f);
+    /* GPU is now fresh. */
+    e->grad->gpu_valid = 1;
+    e->grad->cpu_dirty = 1;
+}
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BACKWARD PASS
@@ -762,36 +798,40 @@ void nt_tape_backward(int loss_idx) {
                 int in_d = pw->output->ndim >= 2 ? pw->output->shape[1] : pw->output->len / out_d;
                 int w_frozen = pw->frozen;     // skip dw if W is frozen (LoRA on frozen base)
                 int x_frozen = px->frozen;     // also skip dx if X chain is frozen (rare)
-                float* dw = w_frozen ? NULL : (float*)calloc(pw->output->len, sizeof(float));
-                float* dx = x_frozen ? NULL : (float*)calloc(px->output->len, sizeof(float));
+                float* dw = NULL;
+                float* dx = NULL;
                 int bw_done_gpu = 0;
 #ifdef USE_CUDA
-                /* GPU backward path: dout, X, W, dx, dw on GPU; download dx/dw
-                 * for tape_acc_grad which expects host floats. */
-                if (g_use_gpu && (dw || w_frozen) && (dx || x_frozen)) {
-                    /* dout currently lives in e->grad->data (CPU). Upload it. */
+                /* GPU backward path: stays GPU-resident.
+                 * dW grad accumulates directly on pw->grad->d_data via cuBLAS
+                 * axpy. Same for dX → px->grad->d_data. Saves the full
+                 * download → calloc → CPU-add chain of v1. */
+                if (g_use_gpu && (!w_frozen || !x_frozen)) {
                     float* d_dout = nt_tensor_ensure_gpu(e->grad);
                     float* d_W = nt_tensor_ensure_gpu(pw->output);
                     float* d_X = nt_tensor_ensure_gpu(px->output);
-                    float* d_dx = NULL;
-                    float* d_dw = NULL;
-                    if (!x_frozen) d_dx = gpu_scratch(3, px->output->len);
-                    if (!w_frozen) d_dw = gpu_scratch(4, pw->output->len);
+                    float* d_dx = !x_frozen ? gpu_scratch(3, px->output->len) : NULL;
+                    float* d_dw = !w_frozen ? gpu_scratch(4, pw->output->len) : NULL;
                     if (d_dout && d_W && d_X &&
                         ((x_frozen) || d_dx) && ((w_frozen) || d_dw)) {
-                        /* dx[T, in_d] = dout[T, out_d] @ W[out_d, in_d] — NN gemm */
                         if (!x_frozen)
                             gpu_sgemm_nn(T, in_d, out_d, d_dout, d_W, d_dx);
-                        /* dw[out_d, in_d] = dout^T[out_d, T] @ X[T, in_d]    — TN gemm
-                         *   gpu_sgemm_tn(M, N, K, A, B, C):  C(M,N) = A^T(K,M) × B(K,N)
-                         *   M = out_d, N = in_d, K = T,  A=dout(T,out_d), B=X(T,in_d) */
                         if (!w_frozen)
                             gpu_sgemm_tn(out_d, in_d, T, d_dout, d_X, d_dw);
-                        if (!x_frozen) gpu_download(dx, d_dx, px->output->len);
-                        if (!w_frozen) gpu_download(dw, d_dw, pw->output->len);
+                        if (!w_frozen)
+                            tape_acc_grad_gpu(e->parent1, d_dw, pw->output->len);
+                        if (!x_frozen)
+                            tape_acc_grad_gpu(e->parent2, d_dx, px->output->len);
                         bw_done_gpu = 1;
                     }
                 }
+                if (!bw_done_gpu) {
+                    dw = w_frozen ? NULL : (float*)calloc(pw->output->len, sizeof(float));
+                    dx = x_frozen ? NULL : (float*)calloc(px->output->len, sizeof(float));
+                }
+#else
+                dw = w_frozen ? NULL : (float*)calloc(pw->output->len, sizeof(float));
+                dx = x_frozen ? NULL : (float*)calloc(px->output->len, sizeof(float));
 #endif
                 if (!bw_done_gpu && ((dw || w_frozen) && (dx || x_frozen))) {
                     float* Wd = pw->output->data;
@@ -829,11 +869,12 @@ void nt_tape_backward(int loss_idx) {
                     }
 #endif
                 }
-                if ((dw || w_frozen) && (dx || x_frozen)) {
+                if (!bw_done_gpu && ((dw || w_frozen) && (dx || x_frozen))) {
                     if (!w_frozen) tape_acc_grad(e->parent1, dw, pw->output->len);
                     if (!x_frozen) tape_acc_grad(e->parent2, dx, px->output->len);
                 }
-                free(dw); free(dx);
+                if (dw) free(dw);
+                if (dx) free(dx);
             }
             break;
         }
@@ -1170,13 +1211,15 @@ void nt_tape_backward(int loss_idx) {
                     float* d_O_tmp  = gpu_scratch(7,  T * out_dim);
                     float* d_d_attn  = gpu_scratch(13, nr * T * T);
                     float* d_d_score = gpu_scratch(14, nr * T * T);
-                    /* Per-tensor scratch for backward outputs (T*E, combined_len, T*out_dim).
-                     * Use fresh slots 15 + dynamic alloc for combined_len if it's large. */
-                    float* d_dX = gpu_scratch(15, T * n_embd);
-                    /* Slots are 16 — running out. Allocate transient buffers via gpu_alloc
-                     * for d_dWr_combined and d_dV (one-time per backward). */
-                    float* d_dWr = gpu_alloc(combined_len);
-                    float* d_dV  = gpu_alloc(T * out_dim);
+                    /* All scratch via persistent slots — avoid per-call cudaMalloc. */
+                    float* d_dX  = gpu_scratch(15, T * n_embd);
+                    /* Slots 11..14 already used by other backward paths above — but
+                     * those paths run sequentially per backward pass (different ops),
+                     * so slot reuse across distinct op-cases in the same backward
+                     * call is safe. d_dWr fits in slot 11 (CE backward path scratch),
+                     * d_dV in slot 0 (forward silu, not running here). */
+                    float* d_dWr = gpu_scratch(11, combined_len);
+                    float* d_dV  = gpu_scratch(0, T * out_dim);
                     if (d_X && d_Wr && d_V && d_dout && d_U && d_scores && d_O_tmp &&
                         d_d_attn && d_d_score && d_dX && d_dWr && d_dV) {
                         /* Recompute forward (writes U and scores). */
@@ -1191,8 +1234,6 @@ void nt_tape_backward(int loss_idx) {
                         gpu_download(dv,  d_dV,  T * out_dim);
                         rrlr_bw_gpu = 1;
                     }
-                    if (d_dWr) gpu_free(d_dWr);
-                    if (d_dV)  gpu_free(d_dV);
                 }
                 if (rrlr_bw_gpu) {
                     tape_acc_grad(e->parent1, dwr, combined_len);
