@@ -477,11 +477,9 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
          * mechanism is here for when external corpora are loaded. */
 
         /* ── Forward ───────────────────────────────────────────────────── */
-        double t_fw0 = coa_now_ms();
         nt_tape_start();
         int loss_idx = coa_forward(m, tokens, targets);
         float lv = nt_tape_get()->entries[loss_idx].output->data[0];
-        double t_fw1 = coa_now_ms();
 
         if (step == 0) { first_loss = lv; loss_ema = lv; }
         else loss_ema = 0.95f * loss_ema + 0.05f * lv;
@@ -489,7 +487,6 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
 
         /* ── Backward ──────────────────────────────────────────────────── */
         nt_tape_backward(loss_idx);
-        double t_bw1 = coa_now_ms();
 
         /* ── NaN guard ─────────────────────────────────────────────────── */
         if (!nt_nan_guard_check(&guard)) {
@@ -537,14 +534,7 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
             stats.blocked++;
         }
 
-        double t_opt1 = coa_now_ms();
         nt_tape_clear();
-        double t_clr1 = coa_now_ms();
-        if (step < 3) {
-            fprintf(stderr, "[TIMING step%d] fw=%.2fs bw=%.2fs opt=%.2fs clear=%.2fs\n",
-                    step, (t_fw1-t_fw0)/1000.0, (t_bw1-t_fw1)/1000.0,
-                    (t_opt1-t_bw1)/1000.0, (t_clr1-t_opt1)/1000.0);
-        }
 
         /* ── Logging ───────────────────────────────────────────────────── */
         if ((step + 1) % COA_LOG_EVERY == 0 || step == 0) {
