@@ -101,6 +101,13 @@ void gpu_cross_entropy_backward(float* d_grad_logits,
                                 const float* d_targets,
                                 int T, int V);
 
+// ── Chuck inner-loop kernel ────────────────────────────────────────
+// Per-element: m, v EMA; m_hat, v_hat bias-corrected; param -= eff_lr * m_hat/(√v_hat + eps).
+// Grad is uploaded; m, v are persistent on GPU; param is read+write.
+void gpu_chuck_inner(float* d_param, float* d_m, float* d_v, const float* d_grad,
+                     int n, float beta1, float beta2, float bc1, float bc2,
+                     float eff_lr, float eps);
+
 // ── RRPRAM low-rank attention (forward + backward) ────────────────
 // Wr_combined layout: [Wr_a flat | Wr_b flat]
 //   Wr_a: H*E*R floats — head h offset = h*E*R, indexed [d, r] = h*E*R + d*R + r

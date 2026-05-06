@@ -658,6 +658,34 @@ extern "C" void gpu_cross_entropy_backward(float* d_grad_logits,
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Chuck inner loop — m, v EMA + bias-correct + param update.
+// Per-element: trivially parallel.
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_chuck_inner(float* p, float* m, float* v, const float* g,
+                                    int n, float beta1, float beta2,
+                                    float bc1, float bc2, float eff_lr, float eps) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gi = g[i];
+    float mi = beta1 * m[i] + (1.0f - beta1) * gi;
+    float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+    float m_hat = mi / bc1;
+    float v_hat = vi / bc2;
+    p[i] -= eff_lr * m_hat / (sqrtf(v_hat) + eps);
+}
+
+extern "C" void gpu_chuck_inner(float* d_param, float* d_m, float* d_v, const float* d_grad,
+                                 int n, float beta1, float beta2, float bc1, float bc2,
+                                 float eff_lr, float eps) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    kernel_chuck_inner<<<blocks, threads>>>(d_param, d_m, d_v, d_grad, n, beta1, beta2, bc1, bc2, eff_lr, eps);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // RRPRAM low-rank attention (forward + backward) — single GPU port
 // Per head h:
 //   U_h[T,R]  = X[T,E] @ Wra_h[E,R]

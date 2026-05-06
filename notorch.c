@@ -2147,22 +2147,46 @@ void nt_tape_chuck_step(float lr, float loss_val) {
         float param_lambda = cp->dampen;
         float effective_lr = lr * global_lambda * param_lambda * cs->lr_scale;
         as->t++;
-        for (int j = 0; j < n; j++) {
-            float g = e->grad->data[j];
-            as->m->data[j] = beta1 * as->m->data[j] + (1.0f - beta1) * g;
-            as->v->data[j] = beta2 * as->v->data[j] + (1.0f - beta2) * g * g;
-            float m_hat = as->m->data[j] / (1.0f - powf(beta1, (float)as->t));
-            float v_hat = as->v->data[j] / (1.0f - powf(beta2, (float)as->t));
-            float update = effective_lr * m_hat / (sqrtf(v_hat) + eps);
-            if (noise_mag > 0.0f) update += noise_mag * chuck_randn();
-            e->output->data[j] -= update;
-        }
+        float bc1 = 1.0f - powf(beta1, (float)as->t);
+        float bc2 = 1.0f - powf(beta2, (float)as->t);
+        int chuck_done_gpu = 0;
 #ifdef USE_CUDA
-        /* CPU just mutated param weights — invalidate GPU mirror so next
-         * forward re-uploads. Per-tensor flag avoids mass re-upload of
-         * params whose Chuck branch was frozen / no grad. */
-        nt_tensor_mark_cpu_dirty(e->output);
+        /* GPU path: trivially parallel m,v update + param step. Skip when
+         * Chuck noise injection is active (rare stagnation escape) since
+         * CPU RNG is harder to port deterministically. */
+        if (g_use_gpu && noise_mag == 0.0f) {
+            float* d_p = nt_tensor_ensure_gpu(e->output);
+            float* d_g = nt_tensor_ensure_gpu(e->grad);
+            float* d_m = nt_tensor_ensure_gpu(as->m);
+            float* d_v = nt_tensor_ensure_gpu(as->v);
+            if (d_p && d_g && d_m && d_v) {
+                gpu_chuck_inner(d_p, d_m, d_v, d_g, n, beta1, beta2, bc1, bc2, effective_lr, eps);
+                /* GPU is now source of truth for param, m, v. Mark CPU stale —
+                 * next forward will read GPU directly without re-upload. */
+                e->output->cpu_dirty = 1; e->output->gpu_valid = 1;
+                as->m->cpu_dirty = 1;     as->m->gpu_valid = 1;
+                as->v->cpu_dirty = 1;     as->v->gpu_valid = 1;
+                chuck_done_gpu = 1;
+            }
+        }
 #endif
+        if (!chuck_done_gpu) {
+            for (int j = 0; j < n; j++) {
+                float g = e->grad->data[j];
+                as->m->data[j] = beta1 * as->m->data[j] + (1.0f - beta1) * g;
+                as->v->data[j] = beta2 * as->v->data[j] + (1.0f - beta2) * g * g;
+                float m_hat = as->m->data[j] / bc1;
+                float v_hat = as->v->data[j] / bc2;
+                float update = effective_lr * m_hat / (sqrtf(v_hat) + eps);
+                if (noise_mag > 0.0f) update += noise_mag * chuck_randn();
+                e->output->data[j] -= update;
+            }
+#ifdef USE_CUDA
+            /* CPU just mutated param weights — invalidate GPU mirror so next
+             * forward re-uploads. */
+            nt_tensor_mark_cpu_dirty(e->output);
+#endif
+        }
         param_idx++;
     }
 #ifdef USE_CUDA
