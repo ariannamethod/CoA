@@ -877,3 +877,366 @@ extern "C" void gpu_rrpram_lr_backward(
         gpu_sgemm_tn_beta(E, R, T, d_X, d_U_h_buf, dWra_h, 1.0f);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SEQ-RMSNORM with optional gamma — forward + backward
+// ═══════════════════════════════════════════════════════════════════
+//
+// y[t,d] = (x[t,d] / rms[t]) * gamma[d]   (gamma optional)
+// Reuses kernel_rmsnorm for the no-gamma path. With gamma we apply it
+// as a separate per-element step.
+
+__global__ void kernel_apply_gamma(float* y, const float* gamma, int T, int D) {
+    int t = blockIdx.x;
+    int d_start = threadIdx.x;
+    if (t >= T) return;
+    for (int d = d_start; d < D; d += blockDim.x)
+        y[t * D + d] *= gamma[d];
+}
+
+extern "C" void gpu_seq_rmsnorm_gamma(float* d_out, const float* d_in,
+                                       const float* d_gamma, int T, int D) {
+    /* y = x / rms */
+    int threads = D < 256 ? D : 256;
+    kernel_rmsnorm<<<T, threads, threads * sizeof(float)>>>(d_out, d_in, T, D);
+    if (d_gamma) {
+        kernel_apply_gamma<<<T, threads>>>(d_out, d_gamma, T, D);
+    }
+}
+
+/* Backward: same as kernel_rmsnorm_backward but with gamma support.
+ *   has_gamma=0: gx[t,d] = (dout/rms) - x*sum(dout*x)/(D*rms^3)
+ *   has_gamma=1: dout_eff = dout * gamma; gx as above with dout_eff;
+ *                gg[d] += sum_t dout[t,d] * (x[t,d] / rms[t]).
+ */
+__global__ void kernel_seq_rmsnorm_backward(float* gx, const float* dout,
+                                            const float* x,
+                                            const float* gamma,
+                                            int T, int D, int has_gamma) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+    const float* x_t = x + t * D;
+    const float* dout_t = dout + t * D;
+    float* gx_t = gx + t * D;
+
+    extern __shared__ float sdata[];
+    float local_ss = 0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        local_ss += x_t[d] * x_t[d];
+    sdata[threadIdx.x] = local_ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = sqrtf(sdata[0] / D + 1e-6f);
+    float rms3 = rms * rms * rms;
+
+    float local_sd = 0;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float de = has_gamma ? dout_t[d] * gamma[d] : dout_t[d];
+        local_sd += de * x_t[d];
+    }
+    sdata[threadIdx.x] = local_sd;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float sum_dx = sdata[0];
+
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float de = has_gamma ? dout_t[d] * gamma[d] : dout_t[d];
+        gx_t[d] = (de / rms) - (x_t[d] * sum_dx / (D * rms3));
+    }
+}
+
+/* gamma gradient kernel: gg[d] = Σ_t dout[t,d] * x[t,d] / rms[t]
+ * Each block handles one d: T-reduction.
+ */
+__global__ void kernel_seq_rmsnorm_gamma_grad(float* gg, const float* dout,
+                                              const float* x,
+                                              int T, int D) {
+    int d = blockIdx.x;
+    if (d >= D) return;
+    extern __shared__ float sdata[];
+    float* rms_buf = sdata;          /* T floats */
+    /* Compute rms[t] first — but we need x[t,*]. Cooperative across threads in block.
+     * Simpler: each thread computes for a t-stripe and accumulates.
+     * Re-derive rms[t] inline (cost: T·D adds; D blocks → total T·D^2 — only OK for tiny D).
+     * For our case D ≤ 768, T ≤ 256 → 50M ops, fine.
+     */
+    float local = 0;
+    for (int t = threadIdx.x; t < T; t += blockDim.x) {
+        const float* x_t = x + t * D;
+        float ss = 0;
+        for (int dd = 0; dd < D; dd++) ss += x_t[dd] * x_t[dd];
+        float rms = sqrtf(ss / D + 1e-6f);
+        local += dout[t * D + d] * (x_t[d] / rms);
+    }
+    rms_buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) rms_buf[threadIdx.x] += rms_buf[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) gg[d] = rms_buf[0];
+}
+
+extern "C" void gpu_seq_rmsnorm_backward(float* d_gx, float* d_gg,
+                                          const float* d_grad, const float* d_x,
+                                          const float* d_gamma, int T, int D) {
+    int threads = D < 256 ? D : 256;
+    int has_gamma = d_gamma ? 1 : 0;
+    kernel_seq_rmsnorm_backward<<<T, threads, threads * sizeof(float)>>>(
+        d_gx, d_grad, d_x, d_gamma, T, D, has_gamma);
+    if (d_gg && d_gamma) {
+        int gthreads = T < 128 ? T : 128;
+        kernel_seq_rmsnorm_gamma_grad<<<D, gthreads, gthreads * sizeof(float)>>>(
+            d_gg, d_grad, d_x, T, D);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SwiGLU forward + backward
+// y[i] = silu(g[i]) * u[i] = g * sigmoid(g) * u
+// dgate = dout * u * silu'(g);  silu'(g) = sig + g*sig*(1-sig)
+// dup   = dout * silu(g)
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_swiglu(float* out, const float* g, const float* u, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i];
+        float sig = 1.0f / (1.0f + expf(-gv));
+        out[i] = gv * sig * u[i];
+    }
+}
+
+__global__ void kernel_swiglu_backward(float* dg, float* du,
+                                       const float* dout, const float* g,
+                                       const float* u, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i];
+        float uv = u[i];
+        float sig = 1.0f / (1.0f + expf(-gv));
+        float silu = gv * sig;
+        float dsilu_dg = sig * (1.0f + gv * (1.0f - sig));
+        dg[i] = dout[i] * uv * dsilu_dg;
+        du[i] = dout[i] * silu;
+    }
+}
+
+extern "C" void gpu_swiglu(float* d_out, const float* d_g, const float* d_u, int n) {
+    kernel_swiglu<<<gpu_blocks(n, 256), 256>>>(d_out, d_g, d_u, n);
+}
+
+extern "C" void gpu_swiglu_backward(float* d_dg, float* d_du,
+                                     const float* d_dout, const float* d_g,
+                                     const float* d_u, int n) {
+    kernel_swiglu_backward<<<gpu_blocks(n, 256), 256>>>(d_dg, d_du, d_dout, d_g, d_u, n);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// RoPE forward + backward
+// Per (t, head, i in head_dim/2):
+//   freq  = 1 / fb^(2i/head_dim)
+//   angle = t * freq
+//   x' = x*cos - y*sin;  y' = x*sin + y*cos
+// Backward (transpose of orthogonal rotation):
+//   dx = dx'*cos + dy'*sin;  dy = -dx'*sin + dy'*cos
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_rope_forward(float* out, const float* in,
+                                    int T, int D, int n_heads, int head_dim, float fb) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int i = threadIdx.x;
+    if (t >= T || h >= n_heads || i >= head_dim / 2) return;
+    int base = t * D + h * head_dim;
+    float freq = 1.0f / powf(fb, 2.0f * i / head_dim);
+    float angle = t * freq;
+    float c = cosf(angle), s = sinf(angle);
+    float x = in[base + 2 * i];
+    float y = in[base + 2 * i + 1];
+    out[base + 2 * i]     = x * c - y * s;
+    out[base + 2 * i + 1] = x * s + y * c;
+}
+
+__global__ void kernel_rope_backward(float* gx, const float* gout,
+                                     int T, int D, int n_heads, int head_dim, float fb) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int i = threadIdx.x;
+    if (t >= T || h >= n_heads || i >= head_dim / 2) return;
+    int base = t * D + h * head_dim;
+    float freq = 1.0f / powf(fb, 2.0f * i / head_dim);
+    float angle = t * freq;
+    float c = cosf(angle), s = sinf(angle);
+    float dx0 = gout[base + 2 * i];
+    float dx1 = gout[base + 2 * i + 1];
+    gx[base + 2 * i]     =  dx0 * c + dx1 * s;
+    gx[base + 2 * i + 1] = -dx0 * s + dx1 * c;
+}
+
+extern "C" void gpu_rope_forward(float* d_out, const float* d_in,
+                                  int T, int D, int n_heads, int head_dim, float fb) {
+    int half = head_dim / 2;
+    if (half <= 0) return;
+    dim3 grid(T, n_heads);
+    int threads = half;
+    kernel_rope_forward<<<grid, threads>>>(d_out, d_in, T, D, n_heads, head_dim, fb);
+}
+
+extern "C" void gpu_rope_backward(float* d_gx, const float* d_gout,
+                                   int T, int D, int n_heads, int head_dim, float fb) {
+    int half = head_dim / 2;
+    if (half <= 0) return;
+    dim3 grid(T, n_heads);
+    int threads = half;
+    kernel_rope_backward<<<grid, threads>>>(d_gx, d_gout, T, D, n_heads, head_dim, fb);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Scale (uniform multiply by scalar) — forward + backward
+//   out[i] = scale * in[i]
+//   gin[i] = scale * gout[i]  (same kernel)
+// Reuses cublasSaxpy + zero-then-axpy.
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_scale(float* out, const float* in, int n, float s) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = s * in[i];
+}
+
+extern "C" void gpu_scale(float* d_out, const float* d_in, int n, float s) {
+    kernel_scale<<<gpu_blocks(n, 256), 256>>>(d_out, d_in, n, s);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sequential embedding lookup (forward) + scatter-add (backward)
+// Forward: y[t, d] = wte[tokens[t], d]
+// Backward: dwte[tokens[t], d] += dout[t, d]
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_seq_embed_forward(float* out, const float* wte,
+                                         const float* tokens,
+                                         int T, int D, int wte_rows) {
+    int t = blockIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= T || d >= D) return;
+    int tok = (int)tokens[t];
+    if (tok < 0) tok = 0;
+    if (tok >= wte_rows) tok = wte_rows - 1;
+    out[t * D + d] = wte[tok * D + d];
+}
+
+__global__ void kernel_seq_embed_backward(float* dwte, const float* dout,
+                                          const float* tokens,
+                                          int T, int D, int wte_rows) {
+    int t = blockIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= T || d >= D) return;
+    int tok = (int)tokens[t];
+    if (tok < 0) tok = 0;
+    if (tok >= wte_rows) tok = wte_rows - 1;
+    atomicAdd(&dwte[tok * D + d], dout[t * D + d]);
+}
+
+extern "C" void gpu_seq_embedding_forward(float* d_out, const float* d_wte,
+                                           const float* d_tokens,
+                                           int T, int D, int wte_rows) {
+    int threads = 256;
+    int dblocks = gpu_blocks(D, threads);
+    dim3 grid(T, dblocks);
+    kernel_seq_embed_forward<<<grid, threads>>>(d_out, d_wte, d_tokens, T, D, wte_rows);
+}
+
+extern "C" void gpu_seq_embedding_backward(float* d_dwte, const float* d_dout,
+                                            const float* d_tokens,
+                                            int T, int D, int wte_rows) {
+    int threads = 256;
+    int dblocks = gpu_blocks(D, threads);
+    dim3 grid(T, dblocks);
+    kernel_seq_embed_backward<<<grid, threads>>>(d_dwte, d_dout, d_tokens, T, D, wte_rows);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sequential cross-entropy (token-level, masked) — forward + backward
+// Forward: per t in [0,T): pick target = (int)tokens[t]; if target == ignore, skip.
+//   Compute log-softmax over V; loss[t] = -log p[target]; mean = Σ valid / N_valid.
+// Backward: dlogits[t,j] = (softmax_j - delta_{j,target}) * (1/N_valid * dout)
+//   Skipped positions: dlogits[t,j] = 0.
+// ═══════════════════════════════════════════════════════════════════
+
+__global__ void kernel_seq_cross_entropy_forward(const float* logits,
+                                                  const float* tokens,
+                                                  float* losses, int* valid_flags,
+                                                  int T, int V, int ignore) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+    int target = (int)tokens[t];
+    if (target == ignore || target < 0 || target >= V) {
+        losses[t] = 0.0f;
+        valid_flags[t] = 0;
+        return;
+    }
+    valid_flags[t] = 1;
+    const float* l = logits + t * V;
+    float mx = l[0];
+    for (int j = 1; j < V; j++) if (l[j] > mx) mx = l[j];
+    float sum = 0;
+    for (int j = 0; j < V; j++) sum += expf(l[j] - mx);
+    losses[t] = -((l[target] - mx) - logf(sum + 1e-10f));
+}
+
+__global__ void kernel_seq_cross_entropy_backward(float* grad_logits,
+                                                   const float* logits,
+                                                   const float* tokens,
+                                                   int T, int V, int ignore,
+                                                   float scale) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+    float* gl = grad_logits + t * V;
+    int target = (int)tokens[t];
+    if (target == ignore || target < 0 || target >= V) {
+        for (int j = 0; j < V; j++) gl[j] = 0.0f;
+        return;
+    }
+    const float* l = logits + t * V;
+    float mx = l[0];
+    for (int j = 1; j < V; j++) if (l[j] > mx) mx = l[j];
+    float sum = 0;
+    for (int j = 0; j < V; j++) sum += expf(l[j] - mx);
+    float inv_sum = 1.0f / (sum + 1e-10f);
+    for (int j = 0; j < V; j++) {
+        float prob = expf(l[j] - mx) * inv_sum;
+        gl[j] = scale * (prob - (j == target ? 1.0f : 0.0f));
+    }
+}
+
+extern "C" float gpu_seq_cross_entropy(const float* d_logits, const float* d_tokens,
+                                        float* d_losses, int* d_valid,
+                                        int T, int V, int ignore) {
+    kernel_seq_cross_entropy_forward<<<T, 1>>>(d_logits, d_tokens, d_losses, d_valid, T, V, ignore);
+    float* h_losses = (float*)malloc(T * sizeof(float));
+    int* h_valid = (int*)malloc(T * sizeof(int));
+    cudaMemcpy(h_losses, d_losses, T * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_valid, d_valid, T * sizeof(int), cudaMemcpyDeviceToHost);
+    float total = 0;
+    int n_valid = 0;
+    for (int t = 0; t < T; t++) { total += h_losses[t]; n_valid += h_valid[t]; }
+    free(h_losses); free(h_valid);
+    return n_valid > 0 ? total / n_valid : 0.0f;
+}
+
+extern "C" void gpu_seq_cross_entropy_backward(float* d_grad_logits,
+                                                const float* d_logits,
+                                                const float* d_tokens,
+                                                int T, int V, int ignore,
+                                                int n_valid) {
+    float scale = n_valid > 0 ? 1.0f / n_valid : 0.0f;
+    kernel_seq_cross_entropy_backward<<<T, 1>>>(d_grad_logits, d_logits, d_tokens,
+                                                T, V, ignore, scale);
+}

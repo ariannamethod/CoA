@@ -133,6 +133,51 @@ void gpu_rrpram_lr_backward(
     float* d_dWr_combined, float* d_dX, float* d_dV,
     float* d_d_attn, float* d_d_score,         /* scratch [H,T,T] */
     int T, int E, int H, int R, int hd);
+
+// ── SEQ-RMSNORM (with optional gamma) ────────────────────────────
+// y = (x / rms) * gamma; if d_gamma == NULL → just x / rms.
+void gpu_seq_rmsnorm_gamma(float* d_out, const float* d_in,
+                            const float* d_gamma, int T, int D);
+// d_gx = grad wrt x, d_gg = grad wrt gamma (NULL if no gamma).
+void gpu_seq_rmsnorm_backward(float* d_gx, float* d_gg,
+                               const float* d_grad, const float* d_x,
+                               const float* d_gamma, int T, int D);
+
+// ── SwiGLU ────────────────────────────────────────────────────────
+void gpu_swiglu(float* d_out, const float* d_g, const float* d_u, int n);
+void gpu_swiglu_backward(float* d_dg, float* d_du,
+                          const float* d_dout, const float* d_g,
+                          const float* d_u, int n);
+
+// ── RoPE (multi-head) ─────────────────────────────────────────────
+// Applies rotation per (t, head, even-odd pair within head_dim).
+void gpu_rope_forward(float* d_out, const float* d_in,
+                      int T, int D, int n_heads, int head_dim, float fb);
+void gpu_rope_backward(float* d_gx, const float* d_gout,
+                       int T, int D, int n_heads, int head_dim, float fb);
+
+// ── Scale ─────────────────────────────────────────────────────────
+void gpu_scale(float* d_out, const float* d_in, int n, float s);
+
+// ── Sequential embedding lookup ───────────────────────────────────
+void gpu_seq_embedding_forward(float* d_out, const float* d_wte,
+                                const float* d_tokens,
+                                int T, int D, int wte_rows);
+void gpu_seq_embedding_backward(float* d_dwte, const float* d_dout,
+                                 const float* d_tokens,
+                                 int T, int D, int wte_rows);
+
+// ── Sequential cross-entropy (mean over valid positions, with ignore_index) ─
+// Returns mean loss; populates d_valid (int per t, 0 or 1).
+float gpu_seq_cross_entropy(const float* d_logits, const float* d_tokens,
+                             float* d_losses, int* d_valid,
+                             int T, int V, int ignore);
+void gpu_seq_cross_entropy_backward(float* d_grad_logits,
+                                     const float* d_logits,
+                                     const float* d_tokens,
+                                     int T, int V, int ignore,
+                                     int n_valid);
+
 #ifdef __cplusplus
 }
 #endif

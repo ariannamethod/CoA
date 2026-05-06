@@ -486,34 +486,56 @@ static void tape_acc_grad_gpu(int idx, const float* d_grad, int len) {
 void nt_tape_backward(int loss_idx) {
     if (loss_idx < 0 || loss_idx >= g_tape.count) return;
 
-#ifdef USE_CUDA
-    /* Forward kept activations resident on GPU (lazy-sync model). Backward
-     * has scattered CPU paths (silu_bwd, rmsnorm_bwd, mul_bwd, etc.) that
-     * dereference px->output->data directly. Pull all dirty mirrors down
-     * once here so each CPU case is correct without per-op instrumentation.
-     * Cost: one D2H per resident activation. Avoids per-op transfers
-     * which are individually small but kernel-launch dominated. */
-    if (g_use_gpu) {
-        for (int i = 0; i <= loss_idx && i < g_tape.count; i++) {
-            nt_tape_entry* e = &g_tape.entries[i];
-            if (e->output) nt_tensor_ensure_cpu(e->output);
-        }
-    }
-#endif
+    /* Lazy GPU/CPU mirror model — no eager D2H prelude. Each bw op-case is
+     * responsible for either staying GPU-resident (GPU branch) or pulling
+     * the specific parents/grads it consumes via nt_tensor_ensure_cpu().
+     * Avoids the avg ~18% GPU-utilization ceiling caused by syncing all
+     * activations at the start of backward. */
 
     nt_tape_entry* loss = &g_tape.entries[loss_idx];
     if (!loss->grad) loss->grad = nt_tensor_new(loss->output->len);
     for (int i = 0; i < loss->grad->len; i++) loss->grad->data[i] = 1.0f;
+#ifdef USE_CUDA
+    /* Loss grad is a CPU-authored fresh value — invalidate any stale GPU mirror. */
+    loss->grad->gpu_valid = 0;
+    loss->grad->cpu_dirty = 0;
+#endif
 
     for (int idx = loss_idx; idx >= 0; idx--) {
         nt_tape_entry* e = &g_tape.entries[idx];
         if (!e->grad) continue;
+#ifdef USE_CUDA
+        /* CPU bw cases read e->grad->data (`dout`) directly. If a downstream
+         * GPU bw kernel deposited the grad via tape_acc_grad_gpu, the CPU
+         * mirror is stale — pull it down now. Cost: one D2H per active grad.
+         * GPU bw cases that ensure_gpu(e->grad) below will see cpu_dirty=0,
+         * gpu_valid=1 and skip the upload. */
+        nt_tensor_ensure_cpu(e->grad);
+#endif
         float* dout = e->grad->data;
         int out_len = e->output->len;
 
         switch (e->op) {
 
         case NT_OP_ADD: {
+#ifdef USE_CUDA
+            if (g_use_gpu) {
+                int p1_match = e->parent1 >= 0 &&
+                    g_tape.entries[e->parent1].output &&
+                    g_tape.entries[e->parent1].output->len == out_len;
+                int p2_match = e->parent2 >= 0 &&
+                    g_tape.entries[e->parent2].output &&
+                    g_tape.entries[e->parent2].output->len == out_len;
+                if (p1_match && p2_match) {
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    if (d_dout) {
+                        tape_acc_grad_gpu(e->parent1, d_dout, out_len);
+                        tape_acc_grad_gpu(e->parent2, d_dout, out_len);
+                        break;
+                    }
+                }
+            }
+#endif
             if (e->parent1 >= 0) tape_acc_grad(e->parent1, dout, out_len);
             if (e->parent2 >= 0) tape_acc_grad(e->parent2, dout, out_len);
             break;
@@ -540,6 +562,17 @@ void nt_tape_backward(int loss_idx) {
 
         case NT_OP_SCALE: {
             if (e->parent1 >= 0) {
+#ifdef USE_CUDA
+                if (g_use_gpu) {
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_ga   = gpu_scratch(3, out_len);
+                    if (d_dout && d_ga) {
+                        gpu_scale(d_ga, d_dout, out_len, e->aux);
+                        tape_acc_grad_gpu(e->parent1, d_ga, out_len);
+                        break;
+                    }
+                }
+#endif
                 float* ga = (float*)calloc(out_len, sizeof(float));
                 if (ga) {
                     for (int i = 0; i < out_len; i++) ga[i] = dout[i] * e->aux;
@@ -753,9 +786,26 @@ void nt_tape_backward(int loss_idx) {
                 nt_tape_entry* ptok = &g_tape.entries[e->parent3];
                 int T = (int)e->aux;
                 int D = (int)e->aux2;
+                int wte_rows = pwte->output->ndim >= 2 ? pwte->output->shape[0] : pwte->output->len / D;
+                int seqemb_done_gpu = 0;
+#ifdef USE_CUDA
+                /* GPU bw — only when no WPE branch (parent2 < 0). WPE handled CPU. */
+                if (g_use_gpu && e->parent2 < 0) {
+                    float* d_dwte = gpu_scratch(3, pwte->output->len);
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_tok  = nt_tensor_ensure_gpu(ptok->output);
+                    if (d_dwte && d_dout && d_tok) {
+                        gpu_zero(d_dwte, pwte->output->len);
+                        gpu_seq_embedding_backward(d_dwte, d_dout, d_tok, T, D, wte_rows);
+                        tape_acc_grad_gpu(e->parent1, d_dwte, pwte->output->len);
+                        seqemb_done_gpu = 1;
+                    }
+                }
+                if (seqemb_done_gpu) break;
+                nt_tensor_ensure_cpu(ptok->output);
+#endif
                 float* dwte = (float*)calloc(pwte->output->len, sizeof(float));
                 if (dwte) {
-                    int wte_rows = pwte->output->ndim >= 2 ? pwte->output->shape[0] : pwte->output->len / D;
                     for (int t = 0; t < T; t++) {
                         int tok = (int)ptok->output->data[t];
                         if (tok < 0) tok = 0;
@@ -883,6 +933,33 @@ void nt_tape_backward(int loss_idx) {
                 int T = (int)e->aux;
                 int D = (int)e->aux2;
                 int has_gamma = (e->parent2 >= 0 && e->parent2 < g_tape.count);
+                int srn_done_gpu = 0;
+#ifdef USE_CUDA
+                if (g_use_gpu) {
+                    float* d_X    = nt_tensor_ensure_gpu(px->output);
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_gamma = NULL;
+                    if (has_gamma) {
+                        nt_tape_entry* pg = &g_tape.entries[e->parent2];
+                        d_gamma = nt_tensor_ensure_gpu(pg->output);
+                    }
+                    float* d_gx = gpu_scratch(3, T * D);
+                    float* d_gg = has_gamma ? gpu_scratch(4, D) : NULL;
+                    if (d_X && d_dout && d_gx && (!has_gamma || (d_gamma && d_gg))) {
+                        if (d_gg) gpu_zero(d_gg, D);
+                        gpu_seq_rmsnorm_backward(d_gx, d_gg, d_dout, d_X, d_gamma, T, D);
+                        tape_acc_grad_gpu(e->parent1, d_gx, T * D);
+                        if (has_gamma && d_gg)
+                            tape_acc_grad_gpu(e->parent2, d_gg, D);
+                        srn_done_gpu = 1;
+                    }
+                }
+#endif
+                if (srn_done_gpu) break;
+#ifdef USE_CUDA
+                nt_tensor_ensure_cpu(px->output);
+                if (has_gamma) nt_tensor_ensure_cpu(g_tape.entries[e->parent2].output);
+#endif
                 float* gamma_data = NULL;
                 if (has_gamma) gamma_data = g_tape.entries[e->parent2].output->data;
 
@@ -1027,17 +1104,15 @@ void nt_tape_backward(int loss_idx) {
                                                           d_dQ_buf, d_dK_buf, d_dV_buf,
                                                           d_scratch_TT, d_scratch_TT2,
                                                           T, D, n_heads);
-                        gpu_download(dq, d_dQ_buf, T * D);
-                        gpu_download(dk, d_dK_buf, T * D);
-                        gpu_download(dv, d_dV_buf, T * D);
+                        /* GPU-resident grad accumulation — no D2H. */
+                        tape_acc_grad_gpu(e->parent1, d_dQ_buf, T * D);
+                        tape_acc_grad_gpu(e->parent2, d_dK_buf, T * D);
+                        tape_acc_grad_gpu(e->parent3, d_dV_buf, T * D);
                         mh_done_gpu = 1;
                     }
                 }
 #endif
                 if (mh_done_gpu) {
-                    tape_acc_grad(e->parent1, dq, T * D);
-                    tape_acc_grad(e->parent2, dk, T * D);
-                    tape_acc_grad(e->parent3, dv, T * D);
                     free(dq); free(dk); free(dv);
                     break;
                 }
@@ -1225,16 +1300,14 @@ void nt_tape_backward(int loss_idx) {
                                                d_dWr, d_dX, d_dV,
                                                d_d_attn, d_d_score,
                                                T, n_embd, nr, rank, hd);
-                        gpu_download(dwr, d_dWr, combined_len);
-                        gpu_download(dx,  d_dX,  T * n_embd);
-                        gpu_download(dv,  d_dV,  T * out_dim);
+                        /* GPU-resident grad accumulation. */
+                        tape_acc_grad_gpu(e->parent1, d_dWr, combined_len);
+                        tape_acc_grad_gpu(e->parent2, d_dX,  (long)T * n_embd);
+                        tape_acc_grad_gpu(e->parent3, d_dV,  (long)T * out_dim);
                         rrlr_bw_gpu = 1;
                     }
                 }
                 if (rrlr_bw_gpu) {
-                    tape_acc_grad(e->parent1, dwr, combined_len);
-                    tape_acc_grad(e->parent2, dx,  (long)T * n_embd);
-                    tape_acc_grad(e->parent3, dv,  (long)T * out_dim);
                     free(dwr); free(dx); free(dv);
                     break;
                 }
@@ -1492,31 +1565,31 @@ void nt_tape_backward(int loss_idx) {
                 nt_tape_entry* pt = &g_tape.entries[e->parent2];
                 int T = (int)e->aux;
                 int V = (int)e->aux2;
-                float* dl = (float*)calloc(T * V, sizeof(float));
                 int ce_done_gpu = 0;
 #ifdef USE_CUDA
-                /* GPU backward: kernel produces (softmax - one_hot) / T scaled by 1.
-                 * Forward dout is loss tensor (length 1) but the gradient flowing back
-                 * to logits is indep of dout's value when dout[0]=1 (loss is leaf in
-                 * graph terms). Standard practice: assume dout[0] propagates as
-                 * scalar through cross-entropy, baking 1/T into kernel.
-                 * Multiply post-hoc by dout[0] to honor chain rule. */
-                if (g_use_gpu && dl && pt) {
-                    float* d_logits = nt_tensor_ensure_gpu(pl->output);
+                /* Pure GPU backward: write straight into pl->grad GPU buffer.
+                 * Kernel produces (softmax - one_hot) / T. The loss tape entry
+                 * carries dout[0] via e->grad which we read on CPU (single
+                 * scalar — cheap). Bake (dout[0] / T) into per-T kernel scale. */
+                if (g_use_gpu) {
+                    float* d_logits  = nt_tensor_ensure_gpu(pl->output);
                     float* d_targets = nt_tensor_ensure_gpu(pt->output);
                     float* d_grad_logits = gpu_scratch(11, T * V);
                     if (d_logits && d_targets && d_grad_logits) {
                         gpu_cross_entropy_backward(d_grad_logits, d_logits, d_targets, T, V);
-                        gpu_download(dl, d_grad_logits, T * V);
-                        /* dout[0] scaling: kernel already divides by T; multiply by dout[0]. */
                         if (dout[0] != 1.0f) {
-                            float s = dout[0];
-                            for (int j = 0; j < T * V; j++) dl[j] *= s;
+                            extern void gpu_axpy(float*, const float*, int, float);
+                            /* Multiply in-place: scratch *= dout[0]; do it via
+                             * a brief CPU read of dout[0] (already on CPU) and
+                             * a kernel-side scale. Reuse gpu_scale for in-place. */
+                            gpu_scale(d_grad_logits, d_grad_logits, T * V, dout[0]);
                         }
+                        tape_acc_grad_gpu(e->parent1, d_grad_logits, T * V);
                         ce_done_gpu = 1;
                     }
                 }
 #endif
+                float* dl = ce_done_gpu ? NULL : (float*)calloc(T * V, sizeof(float));
                 if (!ce_done_gpu && dl && pt) {
                     for (int t = 0; t < T; t++) {
                         float* logits_t = pl->output->data + t * V;
@@ -1834,6 +1907,19 @@ void nt_tape_backward(int loss_idx) {
                 int n_heads = D / head_dim;
 
                 float fb = (e->aux3 > 0.0f) ? e->aux3 : 10000.0f;
+                int rope_done_gpu = 0;
+#ifdef USE_CUDA
+                if (g_use_gpu) {
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_gx   = gpu_scratch(3, total);
+                    if (d_dout && d_gx) {
+                        gpu_rope_backward(d_gx, d_dout, T, D, n_heads, head_dim, fb);
+                        tape_acc_grad_gpu(e->parent1, d_gx, total);
+                        rope_done_gpu = 1;
+                    }
+                }
+#endif
+                if (rope_done_gpu) break;
                 float* gx = (float*)calloc(total, sizeof(float));
                 if (gx) {
                     for (int t = 0; t < T; t++) {
@@ -1868,6 +1954,27 @@ void nt_tape_backward(int loss_idx) {
                 nt_tape_entry* pg = &g_tape.entries[e->parent1];
                 nt_tape_entry* pu = &g_tape.entries[e->parent2];
                 int n = out_len;
+                int swi_done_gpu = 0;
+#ifdef USE_CUDA
+                if (g_use_gpu) {
+                    float* d_G    = nt_tensor_ensure_gpu(pg->output);
+                    float* d_U    = nt_tensor_ensure_gpu(pu->output);
+                    float* d_dout = nt_tensor_ensure_gpu(e->grad);
+                    float* d_dg = gpu_scratch(3, n);
+                    float* d_du = gpu_scratch(4, n);
+                    if (d_G && d_U && d_dout && d_dg && d_du) {
+                        gpu_swiglu_backward(d_dg, d_du, d_dout, d_G, d_U, n);
+                        tape_acc_grad_gpu(e->parent1, d_dg, n);
+                        tape_acc_grad_gpu(e->parent2, d_du, n);
+                        swi_done_gpu = 1;
+                    }
+                }
+#endif
+                if (swi_done_gpu) break;
+#ifdef USE_CUDA
+                nt_tensor_ensure_cpu(pg->output);
+                nt_tensor_ensure_cpu(pu->output);
+#endif
                 float* dg = (float*)calloc(n, sizeof(float));
                 float* du = (float*)calloc(n, sizeof(float));
                 if (dg && du) {
@@ -2505,7 +2612,21 @@ int nt_seq_embedding(int wte_idx, int wpe_idx, int tokens_idx, int T, int D) {
 
     nt_tensor* out = nt_tensor_new(T * D);
     if (!out) return -1;
+
 #ifdef USE_CUDA
+    if (g_use_gpu && wpe_idx < 0) {
+        /* Pure WTE lookup on GPU. Skip WPE branch to keep kernel simple. */
+        float* d_wte = nt_tensor_ensure_gpu(wte->output);
+        float* d_tok = nt_tensor_ensure_gpu(tok->output);
+        float* d_out = nt_tensor_ensure_gpu(out);
+        if (d_wte && d_tok && d_out) {
+            gpu_seq_embedding_forward(d_out, d_wte, d_tok, T, D, wte_rows);
+            nt_tensor_mark_gpu_fresh(out);
+            int idx = nt_tape_record3(out, NT_OP_SEQ_EMBED, wte_idx, wpe_idx, tokens_idx, (float)T, (float)D);
+            nt_tensor_free(out);
+            return idx;
+        }
+    }
     nt_tensor_ensure_cpu(wte->output);
     nt_tensor_ensure_cpu(tok->output);
 #endif
@@ -2519,6 +2640,9 @@ int nt_seq_embedding(int wte_idx, int wpe_idx, int tokens_idx, int T, int D) {
     /* Add position embeddings if provided */
     if (wpe_idx >= 0) {
         nt_tape_entry* wpe = &g_tape.entries[wpe_idx];
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(wpe->output);
+#endif
         int wpe_rows = wpe->output->ndim >= 2 ? wpe->output->shape[0] : wpe->output->len / D;
         for (int t = 0; t < T; t++) {
             int pos = t < wpe_rows ? t : wpe_rows - 1;
@@ -2699,13 +2823,16 @@ int nt_seq_rmsnorm(int x_idx, int gamma_idx, int T, int D) {
     int done_gpu = 0;
 #ifdef USE_CUDA
     if (g_use_gpu) {
-        /* gpu_rmsnorm computes out = x / rms (no gamma). Apply gamma on CPU
-         * after sync to keep parity with backward (which also splits the
-         * gamma factor). */
+        /* GPU forward: y = (x / rms) * gamma (single dispatch, gamma optional). */
         float* d_X = nt_tensor_ensure_gpu(px->output);
         float* d_Y = nt_tensor_ensure_gpu(out);
+        float* d_gamma = NULL;
+        if (gamma_idx >= 0 && gamma_idx < g_tape.count) {
+            nt_tape_entry* pg = &g_tape.entries[gamma_idx];
+            d_gamma = nt_tensor_ensure_gpu(pg->output);
+        }
         if (d_X && d_Y) {
-            gpu_rmsnorm(d_Y, d_X, T, D);
+            gpu_seq_rmsnorm_gamma(d_Y, d_X, d_gamma, T, D);
             nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
@@ -2720,22 +2847,12 @@ int nt_seq_rmsnorm(int x_idx, int gamma_idx, int T, int D) {
             float rms = sqrtf(ss / D + 1e-6f);
             for (int d = 0; d < D; d++) o_t[d] = x_t[d] / rms;
         }
-    }
-
-    if (gamma_idx >= 0 && gamma_idx < g_tape.count) {
-        nt_tape_entry* pg = &g_tape.entries[gamma_idx];
-#ifdef USE_CUDA
-        nt_tensor_ensure_cpu(out);
-        nt_tensor_ensure_cpu(pg->output);
-#endif
-        for (int t = 0; t < T; t++)
-            for (int d = 0; d < D && d < pg->output->len; d++)
-                out->data[t * D + d] *= pg->output->data[d];
-#ifdef USE_CUDA
-        /* CPU was just modified after gamma scale — invalidate GPU mirror. */
-        out->gpu_valid = 0;
-        out->cpu_dirty = 0;
-#endif
+        if (gamma_idx >= 0 && gamma_idx < g_tape.count) {
+            nt_tape_entry* pg = &g_tape.entries[gamma_idx];
+            for (int t = 0; t < T; t++)
+                for (int d = 0; d < D && d < pg->output->len; d++)
+                    out->data[t * D + d] *= pg->output->data[d];
+        }
     }
 
     int g_idx2 = (gamma_idx >= 0 && gamma_idx < g_tape.count) ? gamma_idx : -1;
@@ -3195,10 +3312,8 @@ int nt_swiglu(int gate_idx, int up_idx) {
         float* d_G = nt_tensor_ensure_gpu(pg->output);
         float* d_U = nt_tensor_ensure_gpu(pu->output);
         float* d_Y = nt_tensor_ensure_gpu(out);
-        float* d_S = gpu_scratch(0, n);   /* silu(g) buffer */
-        if (d_G && d_U && d_Y && d_S) {
-            gpu_silu(d_S, d_G, n);
-            gpu_mul(d_Y, d_S, d_U, n);
+        if (d_G && d_U && d_Y) {
+            gpu_swiglu(d_Y, d_G, d_U, n);
             nt_tensor_mark_gpu_fresh(out);
             done_gpu = 1;
         }
@@ -3557,12 +3672,28 @@ int nt_mul(int a_idx, int b_idx) {
     int n = pa->output->len;
     nt_tensor* out = nt_tensor_new(n);
     if (!out) return -1;
+
+    int done_gpu = 0;
 #ifdef USE_CUDA
-    nt_tensor_ensure_cpu(pa->output);
-    nt_tensor_ensure_cpu(pb->output);
+    if (g_use_gpu && pb->output->len == n) {
+        float* d_A = nt_tensor_ensure_gpu(pa->output);
+        float* d_B = nt_tensor_ensure_gpu(pb->output);
+        float* d_Y = nt_tensor_ensure_gpu(out);
+        if (d_A && d_B && d_Y) {
+            gpu_mul(d_Y, d_A, d_B, n);
+            nt_tensor_mark_gpu_fresh(out);
+            done_gpu = 1;
+        }
+    }
 #endif
-    for (int i = 0; i < n; i++)
-        out->data[i] = pa->output->data[i] * pb->output->data[i % pb->output->len];
+    if (!done_gpu) {
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(pa->output);
+        nt_tensor_ensure_cpu(pb->output);
+#endif
+        for (int i = 0; i < n; i++)
+            out->data[i] = pa->output->data[i] * pb->output->data[i % pb->output->len];
+    }
     int idx = nt_tape_record(out, NT_OP_MUL, a_idx, b_idx, 0);
     nt_tensor_free(out);
     return idx;
@@ -3574,10 +3705,25 @@ int nt_scale(int x_idx, float s) {
     int n = px->output->len;
     nt_tensor* out = nt_tensor_new(n);
     if (!out) return -1;
+
+    int done_gpu = 0;
 #ifdef USE_CUDA
-    nt_tensor_ensure_cpu(px->output);
+    if (g_use_gpu) {
+        float* d_X = nt_tensor_ensure_gpu(px->output);
+        float* d_Y = nt_tensor_ensure_gpu(out);
+        if (d_X && d_Y) {
+            gpu_scale(d_Y, d_X, n, s);
+            nt_tensor_mark_gpu_fresh(out);
+            done_gpu = 1;
+        }
+    }
 #endif
-    for (int i = 0; i < n; i++) out->data[i] = px->output->data[i] * s;
+    if (!done_gpu) {
+#ifdef USE_CUDA
+        nt_tensor_ensure_cpu(px->output);
+#endif
+        for (int i = 0; i < n; i++) out->data[i] = px->output->data[i] * s;
+    }
     int idx = nt_tape_record(out, NT_OP_SCALE, x_idx, -1, s);
     nt_tensor_free(out);
     return idx;
@@ -3592,24 +3738,39 @@ int nt_rope_freq(int x_idx, int T, int head_dim, float freq_base) {
     int n_heads = D / head_dim;
     if (n_heads <= 0) return -1;
 
-#ifdef USE_CUDA
-    nt_tensor_ensure_cpu(px->output);
-#endif
-    nt_tensor* out = nt_tensor_clone(px->output);
+    nt_tensor* out = nt_tensor_new(total);
     if (!out) return -1;
+    if (px->output->ndim > 0) nt_tensor_reshape(out, px->output->shape, px->output->ndim);
 
-    for (int t = 0; t < T; t++) {
-        for (int h = 0; h < n_heads; h++) {
-            int base = t * D + h * head_dim;
-            for (int i = 0; i < head_dim / 2; i++) {
-                float freq = 1.0f / powf(freq_base, 2.0f * i / head_dim);
-                float angle = t * freq;
-                float cos_a = cosf(angle);
-                float sin_a = sinf(angle);
-                float x0 = out->data[base + 2 * i];
-                float x1 = out->data[base + 2 * i + 1];
-                out->data[base + 2 * i] = x0 * cos_a - x1 * sin_a;
-                out->data[base + 2 * i + 1] = x0 * sin_a + x1 * cos_a;
+    int done_gpu = 0;
+#ifdef USE_CUDA
+    if (g_use_gpu) {
+        float* d_X = nt_tensor_ensure_gpu(px->output);
+        float* d_Y = nt_tensor_ensure_gpu(out);
+        if (d_X && d_Y) {
+            gpu_rope_forward(d_Y, d_X, T, D, n_heads, head_dim, freq_base);
+            nt_tensor_mark_gpu_fresh(out);
+            done_gpu = 1;
+        }
+    }
+    if (!done_gpu) nt_tensor_ensure_cpu(px->output);
+#endif
+
+    if (!done_gpu) {
+        memcpy(out->data, px->output->data, total * sizeof(float));
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < n_heads; h++) {
+                int base = t * D + h * head_dim;
+                for (int i = 0; i < head_dim / 2; i++) {
+                    float freq = 1.0f / powf(freq_base, 2.0f * i / head_dim);
+                    float angle = t * freq;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+                    float x0 = out->data[base + 2 * i];
+                    float x1 = out->data[base + 2 * i + 1];
+                    out->data[base + 2 * i] = x0 * cos_a - x1 * sin_a;
+                    out->data[base + 2 * i + 1] = x0 * sin_a + x1 * cos_a;
+                }
             }
         }
     }
