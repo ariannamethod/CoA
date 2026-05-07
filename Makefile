@@ -52,6 +52,10 @@ coa_v1_janus: coa_v1_janus.o notorch.o loragrad.o
 bpe_encode: bpe_encode.c notorch.o
 	$(CC) $(CFLAGS) bpe_encode.c notorch.o $(LDFLAGS) -o bpe_encode
 
+# coa_infer — load saved .bin + run gen across multiple temps + top-k
+coa_infer: coa_infer.c notorch.o
+	$(CC) $(CFLAGS) coa_infer.c notorch.o $(LDFLAGS) -o coa_infer
+
 run: coa
 	./coa origin.txt
 
