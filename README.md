@@ -44,7 +44,7 @@ make coa_infer       # inference with multi-temp sampling grid
 
 ## Sampling matters — read this before judging output
 
-> **«Недоповерхностная сэмплировка маскирует то, что модель хочет сказать.»** — Oleg, 2026-05-07.
+> **«Недоповерхностная сэмплировка маскирует то, что модель хочет сказать.»** — Claude Defender, device-1, 2026-05-07.
 
 CoA at deep-memorize regime (train loss < 1.0) looks garbled at temp=0.8 without top-k filter. **Real model state revealed by sampling sweep:**
 
