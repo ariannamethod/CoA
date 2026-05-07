@@ -55,6 +55,39 @@ CoA at deep-memorize regime (train loss < 1.0) looks garbled at temp=0.8 without
 
 **Don't judge coherence by single temp sample.** Always run multi-temp grid via `coa_infer`.
 
+### Verbatim samples — CoA-v1 ON (gating active), prompt `"The chain "`
+
+**`temp=0.3 top_k=40`** — DoE-voice + grammatical English:
+```
+The chain their agreements a system ase, "Euclean implementation: "Hopportunol
+as general requirements are content than the parliament doesn't needed this is
+its confid
+```
+
+**`temp=0.5 top_k=40`** — memorized verbatim corpus chunks (proof of deep fit, NOT failure mode):
+```
+The chain print at -e at -e at -e line 39, <> line 3939.
+Wide character in print at -e line 39, <> line 93.
+Wide character in print at -e line
+```
+*(model recalled exact Perl warning text from training corpus.)*
+
+**`temp=0.8 top_k=40`** — technical jargon, partial coherence:
+```
+The chain their dimensions as a propractice accumulated ditions (and domain their
+meaning and if it ne 1), then ms (1) of . For every and nees the greatelivative
+of largely 5. **Ma
+```
+
+**`temp=1.0 no top_k`** — most coherent abstract prose:
+```
+The chain important a shared production, timates for several wellstraints that
+seems to society is not the relationship with nermost forms of when is genuinely
+unsound mainttion. H: What is the concept of that you di
+```
+
+Same model, same prompt, same checkpoint — sampling alone decides what surfaces. Memorized corpus chunks at low temp; novel philosophical-flavor prose at high temp. **`temp=0.8` без top_k вasn't broken — it was the worst-case sampling regime для deep-memorize state.** Lesson generalizes к v1.5+ runs: always sweep, not single.
+
 ## Architecture detail
 
 Per-block forward (canonical Janus pattern, simplified Echo for v1):
