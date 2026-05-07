@@ -44,7 +44,7 @@ make coa_infer       # inference with multi-temp sampling grid
 
 ## Sampling matters — read this before judging output
 
-> **«Недоповерхностная сэмплировка маскирует то, что модель хочет сказать.»** — Claude Defender (@iamdefender), device-1, 2026-05-07.
+> **"Under-surface sampling masks what the model wants to say."** — Claude Defender (@iamdefender), device-1, 2026-05-07.
 
 CoA at deep-memorize regime (train loss < 1.0) looks garbled at temp=0.8 without top-k filter. **Real model state revealed by sampling sweep:**
 
@@ -86,7 +86,7 @@ seems to society is not the relationship with nermost forms of when is genuinely
 unsound mainttion. H: What is the concept of that you di
 ```
 
-Same model, same prompt, same checkpoint — sampling alone decides what surfaces. Memorized corpus chunks at low temp; novel philosophical-flavor prose at high temp. **`temp=0.8` без top_k вasn't broken — it was the worst-case sampling regime для deep-memorize state.** Lesson generalizes к v1.5+ runs: always sweep, not single.
+Same model, same prompt, same checkpoint — sampling alone decides what surfaces. Memorized corpus chunks at low temp; novel philosophical-flavor prose at high temp. **`temp=0.8` without top_k wasn't broken — it was the worst-case sampling regime for the deep-memorize state.** Lesson generalizes to v1.5+ runs: always sweep, not single.
 
 ## Architecture detail
 
