@@ -75,7 +75,12 @@ void lg_signature_from_buffer(const float* buf, int len, float* out_sig) {
     float sign;
     for (int i = 0; i < LG_SIG_DIM; ++i) out_sig[i] = 0.0f;
     for (int i = 0; i < len; ++i) {
-        uint64_t key = lg_mix2((uint64_t)i + 1ULL, (uint64_t)(uint32_t)buf[i]);
+        /* LG-M2: hash the float's bit pattern, not its truncated integer value.
+         * (uint32_t)buf[i] folded every |v|<1 to 0 (position-only key) and was
+         * UB for negative floats per C11 6.3.1.4. memcpy is the portable
+         * reinterpret. */
+        uint32_t bits; memcpy(&bits, &buf[i], sizeof(bits));
+        uint64_t key = lg_mix2((uint64_t)i + 1ULL, (uint64_t)bits);
         lg_count_sketch_hash(key, LG_SIG_DIM, &bin, &sign);
         out_sig[bin] += sign * buf[i];
     }
@@ -159,6 +164,9 @@ int lg_field_init(lg_field_t* f, int n_experts, uint64_t seed) {
     f->dark_cap  = LG_DARK_CAP_DEFAULT;
     f->dark_sigs = (float*)calloc((size_t)f->dark_cap * LG_SIG_DIM, sizeof(float));
 
+    /* LG-L3: `seed` is intentionally unused here — expert geometry is seeded in
+     * lg_field_calibrate_experts (called after origin/boundary are set). Kept
+     * in the signature for API symmetry and a future per-field RNG. */
     (void)seed;
     return 0;
 }
@@ -241,6 +249,18 @@ void lg_field_calibrate_experts(lg_field_t* f, uint64_t seed) {
 
 /* ── voting ────────────────────────────────────────────────────────────────── */
 
+/* Max cosine similarity of `sig` against a log of unit-vector signatures.
+ * Both inputs are unit vectors, so the dot is the cosine. Used for scar/dark
+ * recall (LG-M1). Returns -2.0 for an empty log (never triggers recall). */
+static float lg_max_sim(const float* sig, const float* sigs, int count) {
+    float best = -2.0f;
+    for (int i = 0; i < count; ++i) {
+        float s = lg_dot(sig, sigs + (size_t)i * LG_SIG_DIM, LG_SIG_DIM);
+        if (s > best) best = s;
+    }
+    return best;
+}
+
 lg_verdict_t lg_field_vote(const lg_field_t* f, const float* sig, float* out_alpha) {
     if (out_alpha) *out_alpha = 1.0f;
 
@@ -281,6 +301,37 @@ lg_verdict_t lg_field_vote(const lg_field_t* f, const float* sig, float* out_alp
     if (total_w > 0.0) consensus /= total_w;
     else               consensus  = 0.0;
 
+    /* ── LG-M1: immune-memory recall (read the scar/dark log) ─────────────────
+     * A signature that closely matches a previously-recorded wound is blocked
+     * on sight, independent of the parliament vote. Checked first so consensus
+     * cannot talk the field out of a remembered attack. This turns the
+     * write-only log into actual immunity: a repeat attack costs one batch of
+     * dot products to block. */
+    if (f->scar_count > 0 &&
+        lg_max_sim(sig, f->scar_sigs, f->scar_count) >= LG_RECALL_THRESH) {
+        if (out_alpha) *out_alpha = 0.0f;
+        return LG_SCAR;
+    }
+    if (f->dark_count > 0 &&
+        lg_max_sim(sig, f->dark_sigs, f->dark_count) >= LG_RECALL_THRESH) {
+        if (out_alpha) *out_alpha = 0.0f;
+        return LG_DARK;
+    }
+
+    /* ── LG-M3: hard boundary override — alignment beats consensus ────────────
+     * A sample strongly aligned against the origin (−delta_axis past the
+     * scar/dark threshold) is a boundary attack regardless of what the expert
+     * consensus says. Checked before PASS/WEAKEN so a saturated or mis-trained
+     * consensus cannot pull a boundary-aligned sample up into WEAKEN. */
+    if (-delta_axis >= f->thresh_dark) {
+        if (out_alpha) *out_alpha = 0.0f;
+        return LG_DARK;
+    }
+    if (-delta_axis >= f->thresh_scar) {
+        if (out_alpha) *out_alpha = 0.0f;
+        return LG_SCAR;
+    }
+
     float score = 0.7f * delta_axis + 0.3f * (float)consensus;
 
     if (score >= f->thresh_pass) {
@@ -292,15 +343,6 @@ lg_verdict_t lg_field_vote(const lg_field_t* f, const float* sig, float* out_alp
         if (a < 0.0f) a = 0.0f; if (a > 1.0f) a = 1.0f;
         if (out_alpha) *out_alpha = a;
         return LG_WEAKEN;
-    }
-
-    if (-delta_axis >= f->thresh_dark) {
-        if (out_alpha) *out_alpha = 0.0f;
-        return LG_DARK;
-    }
-    if (-delta_axis >= f->thresh_scar) {
-        if (out_alpha) *out_alpha = 0.0f;
-        return LG_SCAR;
     }
 
     if (score >= f->thresh_freeze) {

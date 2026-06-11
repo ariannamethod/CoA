@@ -112,10 +112,13 @@ h   += linear(w_down, swiglu(gate, up))
 
 ## Loragrad immune layer
 
-Origin (manifest, ~36 lines) calibrates parliament BEFORE training. Each gradient step:
-1. Text signature of input window (trigram count-sketch).
-2. Parliament votes — `(origin_score - boundary_score) ∈ [-1, +1]`.
-3. Verdict routes gradient: PASS = full step, WEAKEN = scaled by α, FREEZE/SCAR/DARK/SILENCE = no update.
+Origin (manifest) calibrates the parliament BEFORE training; a boundary seed corpus calibrates what must not enter the trunk. Each gradient step:
+1. Text signature of the input window (trigram count-sketch).
+2. Immune-memory recall — a window matching a logged scar/dark wound (cosine ≥ 0.90) is blocked on sight, independent of the vote. The scar log is read, not just written.
+3. Parliament votes — discriminative axis `(origin − boundary)` plus a softplus(credit)-weighted expert consensus. A boundary-aligned window is hard-blocked before the score ladder can soften it to WEAKEN.
+4. Verdict routes the gradient: PASS = full step; WEAKEN = gradients scaled by α (the weakened signal is what enters Chuck's m/v EMA, not just the step LR); FREEZE/SCAR/DARK/SILENCE = step skipped, optimizer state untouched.
+
+The parliament is adaptive: expert credits are supervised online from origin (positive) vs boundary-seed (negative) samples, so experts that discriminate correctly gain weight across training. Credit updates touch the parliament only — never the model gradient.
 
 CoA-v1 paired ablation 2026-05-07 confirmed verdict gating regularizes (~80% of gradients modified) — math-distinct from SGD unbiased-convergence theorems.
 

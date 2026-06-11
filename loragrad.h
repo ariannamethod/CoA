@@ -98,6 +98,11 @@ void lg_field_update_experts(lg_field_t* f, const float* sig,
 
 #define LG_CREDIT_CLAMP 10.0f
 
+/* Immune-memory recall threshold (cosine). A signature whose max similarity
+ * against the scar / dark log reaches this is blocked on sight, independent of
+ * the parliament vote — turns the write-only log into actual immunity. */
+#define LG_RECALL_THRESH 0.90f
+
 void lg_field_reset_counters(lg_field_t* f);
 void lg_field_summary(const lg_field_t* f, const char* label);
 

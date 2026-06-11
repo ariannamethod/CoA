@@ -91,6 +91,7 @@
 /* Training */
 #define COA_TRAIN_STEPS   2000      /* smoke: overfit quickly                    */
 #define COA_LR            3e-4f
+#define COA_CREDIT_LR     0.01f     /* LG-M4: adaptive expert-credit learning rate */
 #define COA_LOG_EVERY       50
 #define COA_GEN_LEN        200      /* tokens to generate after training         */
 
@@ -442,6 +443,22 @@ static double coa_now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+/* LG-H2: scale every gradient on the active tape by `scale`. Applies WEAKEN's
+ * alpha to the gradients themselves (not the learning rate), so the weakened
+ * signal is what enters Chuck's m/v EMA instead of leaking full-strength into
+ * later clean steps via momentum (β1=0.9 ≈ 10-step tail). Mirrors loragrad's
+ * canonical half (train_loragrad.c scale_all_grads); pairs with the
+ * blocked-verdict skip already in coa_train. */
+static void coa_scale_all_grads(float scale) {
+    nt_tape* tape = nt_tape_get();
+    if (!tape) return;
+    for (int e = 0; e < tape->count; ++e) {
+        nt_tape_entry* en = &tape->entries[e];
+        if (!en->is_param || !en->grad) continue;
+        for (int k = 0; k < en->grad->len; ++k) en->grad->data[k] *= scale;
+    }
+}
+
 static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
                       int* encoded, int n_chars, int steps, int gating_off)
 {
@@ -456,6 +473,11 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
     nt_schedule sched = nt_schedule_cosine(COA_LR, steps / 10, steps, COA_LR * 0.1f);
     nt_nan_guard guard = nt_nan_guard_new();
     coa_train_stats stats = {0};
+
+    /* LG-M4: boundary seed corpus supplies the negatives for adaptive credit
+     * supervision (origin windows are the positives). Counted once. */
+    int n_boundary = 0;
+    while (COA_BOUNDARY_SEED[n_boundary]) n_boundary++;
 
     float loss_ema = 0, first_loss = 0, best_loss = 99.0f;
     double t0 = coa_now_ms();
@@ -516,6 +538,18 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
         } else {
             verdict = lg_field_vote(field, text_sig, &alpha);
             lg_field_record(field, verdict, text_sig);
+            /* LG-M4: adaptive parliament — supervise expert credits online.
+             * Training window is an origin sample (target_origin=1); a rotating
+             * boundary-seed line supplies the negative (target_origin=0). This
+             * updates parliament credit ONLY — model weights are untouched
+             * here, so the boundary text never pollutes the LM gradient. */
+            lg_field_update_experts(field, text_sig, /*target_origin=*/1, COA_CREDIT_LR);
+            if (n_boundary > 0) {
+                const char* bs = COA_BOUNDARY_SEED[step % n_boundary];
+                float b_sig[LG_SIG_DIM];
+                lg_signature_from_text(bs, (int)strlen(bs), b_sig);
+                lg_field_update_experts(field, b_sig, /*target_origin=*/0, COA_CREDIT_LR);
+            }
         }
         stats.total++;
 
@@ -525,9 +559,12 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
             nt_tape_chuck_step(lr, lv);
             stats.passed++;
         } else if (verdict == LG_WEAKEN) {
-            /* Scaled gradient step */
+            /* LG-H2: scaled-GRADIENT step — scale the grads by alpha so the
+             * weakened signal is what enters Chuck's m/v, then a full-lr step.
+             * (Was lr*alpha, which let the full-strength grad leak into m/v.) */
+            coa_scale_all_grads(alpha);
             nt_tape_clip_grads(1.0f);
-            nt_tape_chuck_step(lr * alpha, lv);
+            nt_tape_chuck_step(lr, lv);
             stats.weakened++;
         } else {
             /* FREEZE / SCAR / DARK / SILENCE — no weight update */
@@ -674,8 +711,21 @@ static void coa_smoke_immune(lg_field_t* field) {
         v_total++;
     }
 
-    printf("  result: aligned %d/%d pass, boundary %d/%d blocked\n\n",
+    printf("  result: aligned %d/%d pass, boundary %d/%d blocked\n",
            a_pass, a_total, v_block, v_total);
+
+    /* LG-M1 recall self-check: re-voting an already-recorded wound must hit the
+     * scar/dark log and block on sight (cosine 1.0 ≥ LG_RECALL_THRESH). Proves
+     * the log is read at vote time, not just written. */
+    if (field->scar_count > 0 || field->dark_count > 0) {
+        const float* logged = field->scar_count > 0 ? field->scar_sigs : field->dark_sigs;
+        float rsig[LG_SIG_DIM], ralpha;
+        memcpy(rsig, logged, sizeof(rsig));
+        lg_verdict_t rv = lg_field_vote(field, rsig, &ralpha);
+        printf("  recall self-check: re-vote logged wound → %s (expect SCAR/DARK)\n",
+               lg_verdict_name(rv));
+    }
+    printf("\n");
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
