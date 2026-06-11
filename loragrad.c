@@ -377,6 +377,15 @@ void lg_field_reset_counters(lg_field_t* f) {
     for (int i = 0; i < LG_VERDICT_COUNT; ++i) f->counters[i] = 0;
 }
 
+/* Clear the scar/dark immune-memory log (counts → 0; backing buffers stay
+ * allocated and are overwritten as new wounds are recorded). Used to drop
+ * smoke-test wounds before a real training run so recall starts clean. */
+void lg_field_reset_memory(lg_field_t* f) {
+    if (!f) return;
+    f->scar_count = 0;
+    f->dark_count = 0;
+}
+
 /* ── adaptive experts (phase 2.5) ──────────────────────────────────────────── */
 
 void lg_field_update_experts(lg_field_t* f, const float* sig,

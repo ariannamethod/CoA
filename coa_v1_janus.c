@@ -455,7 +455,18 @@ static void coa_scale_all_grads(float scale) {
     for (int e = 0; e < tape->count; ++e) {
         nt_tape_entry* en = &tape->entries[e];
         if (!en->is_param || !en->grad) continue;
+        /* CUDA-safe (Codex F1): pull a GPU-fresh grad down before the CPU
+         * multiply, then mark CPU as the source of truth so the next
+         * ensure_gpu in clip/Chuck re-uploads the scaled values. Without this,
+         * a GPU-resident grad would be scaled on a stale CPU mirror and the
+         * change overwritten on the next download — WEAKEN's alpha lost.
+         * nt_tensor_ensure_cpu is a no-op on CPU-only builds. */
+        nt_tensor_ensure_cpu(en->grad);
         for (int k = 0; k < en->grad->len; ++k) en->grad->data[k] *= scale;
+#ifdef USE_CUDA
+        en->grad->gpu_valid = 0;
+        en->grad->cpu_dirty = 0;
+#endif
     }
 }
 
@@ -559,11 +570,15 @@ static void coa_train(coa_model* m, lg_field_t* field, nt_bpe* bpe,
             nt_tape_chuck_step(lr, lv);
             stats.passed++;
         } else if (verdict == LG_WEAKEN) {
-            /* LG-H2: scaled-GRADIENT step — scale the grads by alpha so the
-             * weakened signal is what enters Chuck's m/v, then a full-lr step.
-             * (Was lr*alpha, which let the full-strength grad leak into m/v.) */
-            coa_scale_all_grads(alpha);
+            /* LG-H2: scaled-GRADIENT step — the weakened signal is what enters
+             * Chuck's m/v EMA (was lr*alpha, which leaked the full-strength grad
+             * into m/v). Clip FIRST, then scale (Codex F3a): clipping after the
+             * scale could renormalize alpha*g back to norm 1 and erase alpha;
+             * clip->scale gives a final norm of alpha*min(||g||,1) <= alpha.
+             * (F3b) Chuck's m/sqrt(v) softens alpha within a single step; the
+             * durable weakening lives in the m/v EMA, which is the point of H2. */
             nt_tape_clip_grads(1.0f);
+            coa_scale_all_grads(alpha);
             nt_tape_chuck_step(lr, lv);
             stats.weakened++;
         } else {
@@ -864,6 +879,10 @@ int main(int argc, char** argv) {
 
     /* ── Train ───────────────────────────────────────────────────────────── */
     lg_field_reset_counters(&field);
+    /* Codex F2: the smoke test above records its fixture verdicts into the real
+     * field; clear the scar/dark log so recall does not carry smoke-test wounds
+     * into training. */
+    lg_field_reset_memory(&field);
     if (gating_off) printf("[ABLATION] gating_off — parliament bypassed, pure Chuck\n");
     coa_train(&model, &field, &bpe, encoded, n_tokens, train_steps, gating_off);
 
