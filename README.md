@@ -122,6 +122,21 @@ The parliament is adaptive: expert credits are supervised online from origin (po
 
 CoA-v1 paired ablation 2026-05-07 confirmed verdict gating regularizes (~80% of gradients modified) — math-distinct from SGD unbiased-convergence theorems.
 
+### Testing the immune layer
+
+`coa_smoke_immune` exercises the *vote* — origin/boundary fixtures, recall, the
+verdict ladder — but it runs outside the training loop, with no gradients. The
+training run on the bundled `origin.txt` is all-PASS (the manifesto passes the
+parliament wholesale: `60 total, 60 PASS, 0 WEAKEN, 0 blocked`), so the
+gradient-level paths — WEAKEN grad-scale, blocked-skip, scar recall, the
+boundary override — never fire during a normal smoke. To regression-test them
+you need a **mixed corpus** (origin + injected adversarial windows) so the
+verdicts route real gradients through forward→backward→Chuck on the notorch
+tape, the way loragrad's `train_loragrad --routed` does. Vote-only testing is
+blind to grad-path bugs: the 2026-06-11 audit's F1 (CUDA grad), F2 (smoke
+wounds leaking into training via recall) and F3a (clip erasing WEAKEN's alpha)
+all hid in paths an origin-only run never touched.
+
 ## Provenance
 
 - Reference Janus 3-attention: [`ariannamethod/janus`](https://github.com/ariannamethod/janus) `janus-bpe.c:359-401`
